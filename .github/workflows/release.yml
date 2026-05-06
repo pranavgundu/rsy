@@ -1,4 +1,4 @@
-name: Release
+name: CD
 
 on:
   push:
@@ -9,28 +9,33 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: auto - dist-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          - name: x86_64-linux
+            target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             npm_pkg: rsy-linux-x64
             bin: rsy
-          - target: aarch64-unknown-linux-musl
+          - name: aarch64-linux
+            target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             npm_pkg: rsy-linux-arm64
             bin: rsy
-          - target: x86_64-apple-darwin
+          - name: x86_64-apple
+            target: x86_64-apple-darwin
             os: macos-13
             npm_pkg: rsy-darwin-x64
             bin: rsy
-          - target: aarch64-apple-darwin
+          - name: aarch64-apple
+            target: aarch64-apple-darwin
             os: macos-latest
             npm_pkg: rsy-darwin-arm64
             bin: rsy
-          - target: x86_64-pc-windows-msvc
+          - name: x86_64-msvc
+            target: x86_64-pc-windows-msvc
             os: windows-latest
             npm_pkg: rsy-win32-x64
             bin: rsy.exe
@@ -47,7 +52,6 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y musl-tools
-          # cross for arm64
           cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build (cross for Linux ARM64)
@@ -58,7 +62,7 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage binary into npm package
+      - name: Stage binary
         shell: bash
         run: |
           mkdir -p npm/${{ matrix.npm_pkg }}/bin
@@ -69,8 +73,8 @@ jobs:
           name: ${{ matrix.npm_pkg }}
           path: npm/${{ matrix.npm_pkg }}/bin/
 
-  publish:
-    name: Publish to npm
+  publish-npm:
+    name: auto - publish-npm
     needs: build
     runs-on: ubuntu-latest
     environment: npm-publish
@@ -82,8 +86,7 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Download all binaries
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
@@ -109,7 +112,7 @@ jobs:
         run: npm publish --access public
 
   publish-crate:
-    name: Publish to crates.io
+    name: auto - publish-crate
     needs: build
     runs-on: ubuntu-latest
     steps:
