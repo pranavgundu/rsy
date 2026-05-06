@@ -26,9 +26,10 @@ jobs:
             bin: rsy
           - name: x86_64-apple
             target: x86_64-apple-darwin
-            os: macos-13
+            os: ubuntu-latest
             npm_pkg: rsy-darwin-x64
             bin: rsy
+            use_zigbuild: true
           - name: aarch64-apple
             target: aarch64-apple-darwin
             os: macos-latest
@@ -54,12 +55,24 @@ jobs:
           sudo apt-get install -y musl-tools
           cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Install zigbuild (macOS cross-compile)
+        if: matrix.use_zigbuild
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y python3 wget
+          pip3 install ziglang
+          cargo install cargo-zigbuild
+
       - name: Build (cross for Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --target ${{ matrix.target }}
 
+      - name: Build (zigbuild for macOS cross-compile)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
       - name: Build
-        if: matrix.target != 'aarch64-unknown-linux-musl'
+        if: "!matrix.use_zigbuild && matrix.target != 'aarch64-unknown-linux-musl'"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Stage binary
