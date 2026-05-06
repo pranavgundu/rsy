@@ -1,5 +1,5 @@
 {
-  "name": "rsy",
+  "name": "@gundu/rsy",
   "version": "1.0.0",
   "description": "Fast parallel file synchronizer (rsync alternative)",
   "license": "MIT",
