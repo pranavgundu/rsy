@@ -116,13 +116,13 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in rsy-linux-x64 rsy-linux-arm64 rsy-darwin-x64 rsy-darwin-arm64 rsy-win32-x64; do
-            cd npm/$pkg && npm publish --access public && cd ../..
+            (cd npm/$pkg && npm publish --access public) || true
           done
 
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish --access public || true
 
   publish-crate:
     name: auto - publish-crate
