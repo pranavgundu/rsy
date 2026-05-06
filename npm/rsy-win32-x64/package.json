@@ -1,0 +1,11 @@
+{
+  "name": "@gundu/rsy-win32-x64",
+  "version": "1.0.0",
+  "description": "rsy binary for win32-x64",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "bin/rsy.exe",
+  "files": ["bin/rsy.exe"],
+  "license": "MIT",
+  "repository": "https://github.com/pranavgundu/rsy"
+}

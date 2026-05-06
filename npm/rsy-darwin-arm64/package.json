@@ -1,0 +1,11 @@
+{
+  "name": "@gundu/rsy-darwin-arm64",
+  "version": "1.0.0",
+  "description": "rsy binary for darwin-arm64",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "main": "bin/rsy",
+  "files": ["bin/rsy"],
+  "license": "MIT",
+  "repository": "https://github.com/pranavgundu/rsy"
+}

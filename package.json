@@ -1,0 +1,29 @@
+{
+  "name": "rsy",
+  "version": "1.0.0",
+  "description": "Fast parallel file synchronizer (rsync alternative)",
+  "license": "MIT",
+  "repository": "https://github.com/pranavgundu/rsy",
+  "homepage": "https://github.com/pranavgundu/rsy",
+  "keywords": ["rsync", "sync", "file-transfer", "backup", "cli"],
+  "bin": {
+    "rsy": "bin/rsy"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "optionalDependencies": {
+    "@gundu/rsy-linux-x64":    "1.0.0",
+    "@gundu/rsy-linux-arm64":  "1.0.0",
+    "@gundu/rsy-darwin-x64":   "1.0.0",
+    "@gundu/rsy-darwin-arm64": "1.0.0",
+    "@gundu/rsy-win32-x64":    "1.0.0"
+  },
+  "files": [
+    "bin/",
+    "install.js"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}
