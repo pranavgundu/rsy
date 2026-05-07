@@ -40,7 +40,6 @@ impl FileList {
         let root = std::fs::canonicalize(root)?;
 
         let paths: Vec<PathBuf> = WalkDir::new(&root)
-            .sort_by_file_name()
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())

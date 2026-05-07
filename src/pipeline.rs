@@ -58,6 +58,30 @@ fn confine_path(base: &Path, rel: &Path) -> Result<PathBuf> {
 
     Ok(base.join(clean_rel))
 }
+
+fn safe_symlink_target(target: &Path) -> bool {
+    use std::path::Component;
+
+    if target.is_absolute() {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for c in target.components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
 use crate::delta::{BlockSum, Token, basis_sums, diff, patch, token_stats};
 use crate::filter::FilterList;
 use crate::flist::{EntryKind, FileEntry, FileList, device_id};
@@ -219,6 +243,9 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
         .iter()
         .filter(|e| e.is_dir())
         .try_for_each(|e| {
+            if opts.dry_run {
+                return Ok::<_, anyhow::Error>(());
+            }
             let dst = confine_path(dst_root, &e.path)?;
             fs::create_dir_all(dst)?;
             Ok::<_, anyhow::Error>(())
@@ -227,6 +254,16 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
     // Symlinks
     for e in src_filtered.iter() {
         if let EntryKind::Symlink { target } = &e.kind {
+            if opts.dry_run {
+                continue;
+            }
+            if !safe_symlink_target(target) {
+                eprintln!(
+                    "warning: skipping symlink with unsafe target: {}",
+                    e.path.display()
+                );
+                continue;
+            }
             let dst = confine_path(dst_root, &e.path)?;
             let _ = fs::remove_file(&dst);
             if let Some(p) = dst.parent() {
@@ -297,6 +334,9 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
             src_list.0.iter().map(|e| &e.path).collect();
         for e in &dst_list.0 {
             if !src_paths.contains(&e.path) {
+                if opts.dry_run {
+                    continue;
+                }
                 let p = match confine_path(dst_root, &e.path) {
                     Ok(p) => p,
                     Err(err) => {
@@ -373,20 +413,26 @@ fn write_file_atomically(dst: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn copy_file_atomically(src: &Path, dst: &Path) -> Result<()> {
-    let (tmp, mut out) = create_unique_tmp_file(dst)?;
+    let (tmp, out) = create_unique_tmp_file(dst)?;
+    drop(out);
     let copy_res: Result<()> = (|| {
-        let mut input = fs::File::open(src)?;
-        std::io::copy(&mut input, &mut out)?;
-        out.flush()?;
+        fs::copy(src, &tmp)?;
         Ok(())
     })();
-    drop(out);
     if let Err(e) = copy_res {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     if let Err(e) = fs::rename(&tmp, dst) {
         let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn copy_new_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Err(e) = fs::copy(src, dst) {
+        let _ = fs::remove_file(dst);
         return Err(e.into());
     }
     Ok(())
@@ -444,7 +490,7 @@ fn sync_one(
     // where we don't have the pre-create phase.
     // Fast path: new file — copy directly to dst (no tmp needed, nothing to protect)
     if !basis_exists && !opts.checksum {
-        copy_file_atomically(src, dst)?;
+        copy_new_file(src, dst)?;
         set_metadata(dst, entry, opts)?;
         if opts.verbose {
             eprintln!("{}", entry.path.display());
@@ -455,6 +501,15 @@ fn sync_one(
     // Very large files: skip delta to avoid multi-GB mmap page-fault hangs
     const DELTA_SIZE_LIMIT: u64 = 512 * 1024 * 1024; // 512 MB
     if !opts.checksum && entry.size > DELTA_SIZE_LIMIT {
+        copy_file_atomically(src, dst)?;
+        set_metadata(dst, entry, opts)?;
+        if opts.verbose {
+            eprintln!("{}", entry.path.display());
+        }
+        return Ok((true, entry.size, 0));
+    }
+
+    if opts.whole_file && !opts.checksum {
         copy_file_atomically(src, dst)?;
         set_metadata(dst, entry, opts)?;
         if opts.verbose {
@@ -673,17 +728,9 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
                 continue;
             }
             EntryKind::Symlink { target } => {
-                // Reject absolute symlink targets and targets that escape via ..
                 #[cfg(unix)]
                 {
-                    use std::path::Component;
-                    let is_absolute = target.is_absolute();
-                    let escapes = target.components().fold(0i32, |depth, c| match c {
-                        Component::ParentDir => depth - 1,
-                        Component::Normal(_) => depth + 1,
-                        _ => depth,
-                    }) < 0;
-                    if is_absolute || escapes {
+                    if !safe_symlink_target(target) {
                         eprintln!(
                             "warning: skipping symlink with unsafe target: {}",
                             entry.path.display()
@@ -912,6 +959,15 @@ mod tests {
         assert!(confine_path(base.path(), Path::new("linked/file.txt")).is_err());
     }
 
+    #[test]
+    fn safe_symlink_target_rejects_escape() {
+        assert!(safe_symlink_target(Path::new("target")));
+        assert!(safe_symlink_target(Path::new("dir/../target")));
+        assert!(!safe_symlink_target(Path::new("/etc/passwd")));
+        assert!(!safe_symlink_target(Path::new("../outside")));
+        assert!(!safe_symlink_target(Path::new("dir/../../outside")));
+    }
+
     // ── sync_local integration ──────────────────────────────────────────────────
 
     fn default_opts() -> SyncOpts {
@@ -1048,14 +1104,23 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("file.txt"), b"data").unwrap();
+        fs::create_dir(src.path().join("dir")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file.txt", src.path().join("link")).unwrap();
+        fs::write(dst.path().join("stale.txt"), b"stale").unwrap();
 
         let opts = SyncOpts {
             dry_run: true,
+            delete: true,
             ..Default::default()
         };
         sync_local(src.path(), dst.path(), &opts).unwrap();
 
         assert!(!dst.path().join("file.txt").exists());
+        assert!(!dst.path().join("dir").exists());
+        assert!(dst.path().join("stale.txt").exists());
+        #[cfg(unix)]
+        assert!(!dst.path().join("link").exists());
     }
 
     #[test]

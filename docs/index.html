@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mathematical Notes on rsy Transfer Improvements</title>
+    <script>
+      window.MathJax = {
+        tex: {
+          tags: "ams",
+          inlineMath: [["$", "$"], ["\\(", "\\)"]],
+          displayMath: [["$$", "$$"], ["\\[", "\\]"]]
+        }
+      };
+    </script>
+    <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #171717;
+        --muted: #555;
+        --rule: #d8d8d8;
+        --paper: #fffdf8;
+      }
+
+      body {
+        margin: 0;
+        background: #efede6;
+        color: var(--ink);
+        font-family: "Times New Roman", Times, serif;
+        line-height: 1.55;
+      }
+
+      main {
+        max-width: 880px;
+        margin: 36px auto;
+        padding: 56px 68px;
+        background: var(--paper);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+      }
+
+      h1, h2, h3 {
+        font-weight: 700;
+        line-height: 1.15;
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        text-align: center;
+        font-size: 2rem;
+      }
+
+      .authors, .date {
+        text-align: center;
+        color: var(--muted);
+      }
+
+      .abstract {
+        margin: 34px 0;
+        padding: 18px 22px;
+        border-top: 1px solid var(--rule);
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .abstract strong {
+        display: block;
+        text-align: center;
+        margin-bottom: 8px;
+      }
+
+      h2 {
+        margin-top: 38px;
+        padding-bottom: 5px;
+        border-bottom: 1px solid var(--rule);
+        font-size: 1.25rem;
+      }
+
+      h3 {
+        margin-top: 26px;
+        font-size: 1.05rem;
+      }
+
+      p {
+        text-align: justify;
+      }
+
+      ol {
+        padding-left: 24px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 24px 0;
+        font-size: 0.96rem;
+      }
+
+      th, td {
+        border-top: 1px solid var(--rule);
+        border-bottom: 1px solid var(--rule);
+        padding: 8px 10px;
+        text-align: left;
+      }
+
+      caption {
+        caption-side: bottom;
+        padding-top: 8px;
+        color: var(--muted);
+      }
+
+      .theorem {
+        margin: 20px 0;
+        padding: 14px 18px;
+        border-left: 3px solid #111;
+        background: #faf7ee;
+      }
+
+      .small {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      @media (max-width: 760px) {
+        main {
+          margin: 0;
+          padding: 30px 22px;
+          box-shadow: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Asymptotic and Constant-Factor Improvements in rsy File Synchronization</h1>
+      <div class="authors">Pranav Gundu</div>
+      <div class="date">Technical Note, Version 1.0</div>
+
+      <section class="abstract">
+        <strong>Abstract</strong>
+        <p>
+          We present a compact mathematical account of recent implementation changes to
+          <em>rsy</em>, a parallel file synchronization tool. The analysis models traversal,
+          whole-file copying, atomic replacement, and delta synchronization. The primary
+          result is not a change in worst-case computational class, but a reduction in
+          dominant constant factors for common cold-copy and whole-file workloads.
+        </p>
+      </section>
+
+      <h2>1. Model</h2>
+      <p>
+        Let $F$ denote the number of regular files, $D$ the number of directories, $L$ the
+        number of symbolic links, and $B = \sum_{i=1}^{F} b_i$ the total number of bytes in
+        the source corpus. Let $T_{old}$ be the pre-optimization runtime and $T_{new}$ be
+        the optimized runtime. We decompose runtime as
+      </p>
+      $$
+      T = T_{walk} + T_{meta} + T_{copy} + T_{delta} + T_{verify} + T_{ui}.
+      \tag{1}
+      $$
+      <p>
+        For a cold synchronization, no destination basis exists for most files, so
+      </p>
+      $$
+      T_{delta} \approx 0, \qquad T_{copy} \gg T_{walk} + T_{meta}.
+      \tag{2}
+      $$
+
+      <h2>2. Traversal Improvement</h2>
+      <p>
+        The previous file-list construction performed one name-order traversal and then a
+        final deterministic sort. This is modeled by
+      </p>
+      $$
+      T_{walk}^{old}(N) = c_w N + c_s N\log N + c_p N + c_s' N\log N,
+      \tag{3}
+      $$
+      <p>
+        where $N = F + D + L$, $c_s N\log N$ is the traversal-level sort, and
+        $c_s' N\log N$ is the final sort. After removing the redundant traversal sort,
+      </p>
+      $$
+      T_{walk}^{new}(N) = c_w N + c_p N + c_s' N\log N.
+      \tag{4}
+      $$
+      <p>
+        Hence the direct improvement is
+      </p>
+      $$
+      \Delta T_{walk}(N)
+      = T_{walk}^{old}(N) - T_{walk}^{new}(N)
+      = c_s N\log N.
+      \tag{5}
+      $$
+
+      <div class="theorem">
+        <strong>Proposition 1.</strong>
+        For any corpus with $N &gt; 1$, removing one full ordering pass yields a strictly
+        positive traversal saving proportional to $N\log N$.
+        $$
+        \forall N &gt; 1,\quad \Delta T_{walk}(N) = c_s N\log N &gt; 0.
+        \tag{6}
+        $$
+      </div>
+
+      <h2>3. Cold-Copy Path</h2>
+      <p>
+        For a new file of size $b_i$, the former path created a temporary file, copied
+        bytes through userspace, flushed, and renamed. A simplified model is
+      </p>
+      $$
+      T_{copy,i}^{old}
+      = \alpha_{open} + \alpha_{tmp} + \alpha_{rw} b_i + \alpha_{flush}
+      + \alpha_{rename} + \alpha_{mtime}.
+      \tag{7}
+      $$
+      <p>
+        The new cold-file path copies directly with the platform copy primitive:
+      </p>
+      $$
+      T_{copy,i}^{new}
+      = \beta_{copy} b_i + \beta_{open} + \beta_{mtime}.
+      \tag{8}
+      $$
+      <p>
+        Summing over all cold files gives
+      </p>
+      $$
+      T_{copy}^{old} = \sum_{i=1}^{F}
+      \left(\alpha_{open} + \alpha_{tmp} + \alpha_{rw} b_i + \alpha_{flush}
+      + \alpha_{rename} + \alpha_{mtime}\right),
+      \tag{9}
+      $$
+      $$
+      T_{copy}^{new} = \sum_{i=1}^{F}
+      \left(\beta_{copy} b_i + \beta_{open} + \beta_{mtime}\right).
+      \tag{10}
+      $$
+      <p>
+        The expected speedup factor for cold copies is therefore
+      </p>
+      $$
+      S_{cold}
+      = \frac{T_{copy}^{old}}{T_{copy}^{new}}
+      = \frac{F(\alpha_{open}+\alpha_{tmp}+\alpha_{flush}+\alpha_{rename}+\alpha_{mtime})
+      + \alpha_{rw}B}
+      {F(\beta_{open}+\beta_{mtime}) + \beta_{copy}B}.
+      \tag{11}
+      $$
+
+      <h2>4. Whole-File Fast Path</h2>
+      <p>
+        In whole-file mode, the old execution could still enter read or mapping setup
+        before concluding that no delta computation was needed. Let $m_i$ represent mmap
+        setup cost and $r_i$ represent avoidable read-preparation cost. Then
+      </p>
+      $$
+      T_{whole,i}^{old} = m_i + r_i + T_{copy,i}^{atomic},
+      \tag{12}
+      $$
+      <p>
+        while the optimized path is
+      </p>
+      $$
+      T_{whole,i}^{new} = T_{copy,i}^{atomic}.
+      \tag{13}
+      $$
+      <p>
+        Thus the removed overhead is
+      </p>
+      $$
+      \Delta T_{whole}
+      = \sum_{i=1}^{F}(m_i + r_i).
+      \tag{14}
+      $$
+
+      <h2>5. Delta Synchronization</h2>
+      <p>
+        For modified files with an existing basis, rsy uses a rolling weak checksum and a
+        strong checksum. Let block size be $q$, number of blocks be $K = \lceil b/q\rceil$,
+        and source length be $b$. Basis summarization is
+      </p>
+      $$
+      T_{sum}(b,q) = \gamma_1 Kq + \gamma_2 K
+      = \gamma_1 b + \gamma_2\left\lceil\frac{b}{q}\right\rceil.
+      \tag{15}
+      $$
+      <p>
+        Rolling search is approximately linear in source bytes:
+      </p>
+      $$
+      T_{roll}(b,q) = \rho b + \sigma M,
+      \tag{16}
+      $$
+      <p>
+        where $M$ is the number of candidate strong-check verifications. With a hash table
+        of weak sums,
+      </p>
+      $$
+      \mathbb{E}[M] = \sum_{j=1}^{b-q+1}\Pr[h_w(x_j) \in H]
+      \approx \frac{(b-q+1)K}{2^{32}}.
+      \tag{17}
+      $$
+      <p>
+        The total delta cost is therefore
+      </p>
+      $$
+      T_{delta}(b,q)
+      = \gamma_1 b
+      + \gamma_2\left\lceil\frac{b}{q}\right\rceil
+      + \rho b
+      + \sigma\frac{(b-q+1)}{2^{32}}\left\lceil\frac{b}{q}\right\rceil.
+      \tag{18}
+      $$
+
+      <h2>6. Safety-Preserving Dry Run</h2>
+      <p>
+        A dry run should approximate the planning phase without applying filesystem
+        mutations. Let $\mathcal{M}$ be the set of mutating operations:
+      </p>
+      $$
+      \mathcal{M} = \{ mkdir, symlink, unlink, rmdir, write, rename, chmod, chown, utime \}.
+      \tag{19}
+      $$
+      <p>
+        The desired dry-run property is
+      </p>
+      $$
+      dry\_run = 1 \implies \forall m \in \mathcal{M},\; count(m)=0.
+      \tag{20}
+      $$
+      <p>
+        The implementation now excludes directory creation, symlink creation, and delete
+        operations from dry-run execution, moving the local behavior closer to (20).
+      </p>
+
+      <h2>7. Summary Table</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Component</th>
+            <th>Old Cost</th>
+            <th>New Cost</th>
+            <th>Saving</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Traversal sort</td>
+            <td>$c_sN\log N + c_s'N\log N$</td>
+            <td>$c_s'N\log N$</td>
+            <td>$c_sN\log N$</td>
+          </tr>
+          <tr>
+            <td>New-file copy</td>
+            <td>$\alpha_{rw}B + O(F)$</td>
+            <td>$\beta_{copy}B + O(F)$</td>
+            <td>$(\alpha_{rw}-\beta_{copy})B + O(F)$</td>
+          </tr>
+          <tr>
+            <td>Whole-file mode</td>
+            <td>$T_{copy}+\sum(m_i+r_i)$</td>
+            <td>$T_{copy}$</td>
+            <td>$\sum(m_i+r_i)$</td>
+          </tr>
+          <tr>
+            <td>Dry run</td>
+            <td>$count(\mathcal{M}) \ge 0$</td>
+            <td>$count(\mathcal{M}) \to 0$</td>
+            <td>Safety improvement</td>
+          </tr>
+        </tbody>
+        <caption>Table 1. Simplified cost comparison of the optimized implementation.</caption>
+      </table>
+
+      <h2>8. Conclusion</h2>
+      <p>
+        The revised implementation preserves the same high-level asymptotic behavior for
+        synchronization while removing redundant ordering work and reducing copy-path
+        overhead. In the common cold-copy regime, the practical improvement is governed by
+        Equation (11). In whole-file mode, the improvement is the eliminated setup term in
+        Equation (14). These changes favor large corpora, many-file workloads, and cases
+        where filesystem copy primitives outperform manual userspace copying.
+      </p>
+
+    </main>
+  </body>
+</html>
