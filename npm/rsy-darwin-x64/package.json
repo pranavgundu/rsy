@@ -1,6 +1,6 @@
 {
   "name": "@gundu/rsy-darwin-x64",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "rsy binary for darwin-x64",
   "os": ["darwin"],
   "cpu": ["x64"],
