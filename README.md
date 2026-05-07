@@ -13,7 +13,7 @@ Run yourself: `cargo bench`
 
 | Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------------------:|----------------:|-------------------:|
-| <span style="color:green"><strong>WINNER: rsy</strong></span> | 126 | 309.5 | 1.00x | - |
+| **rsy ✓** | 126 | 309.5 | 1.00x | - |
 | rsync | 483 | 80.7 | rsy is 3.83x faster | rsy saves 357 ms (73.9%) |
 | cp | 245 | 159.2 | rsy is 1.94x faster | rsy saves 119 ms (48.6%) |
 
@@ -23,7 +23,7 @@ Technical note: Small-file workloads are metadata and syscall heavy; rsy benefit
 
 | Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------------------:|----------------:|-------------------:|
-| <span style="color:green"><strong>WINNER: rsy</strong></span> | 35 | 14285.7 | 1.00x | - |
+| **rsy ✓** | 35 | 14285.7 | 1.00x | - |
 | rsync | 272 | 1838.2 | rsy is 7.77x faster | rsy saves 237 ms (87.1%) |
 | cp | 116 | 4310.3 | rsy is 3.31x faster | rsy saves 81 ms (69.8%) |
 
@@ -33,7 +33,7 @@ Technical note: Parallel I/O and lower per-file overhead produce a large latency
 
 | Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------------------:|----------------:|-------------------:|
-| <span style="color:green"><strong>WINNER: rsy</strong></span> | 98 | 16326.5 | 1.00x | - |
+| **rsy ✓** | 98 | 16326.5 | 1.00x | - |
 | rsync | 715 | 2237.8 | rsy is 7.30x faster | rsy saves 617 ms (86.3%) |
 | cp | 335 | 4776.1 | rsy is 3.42x faster | rsy saves 237 ms (70.7%) |
 
@@ -45,7 +45,7 @@ Technical note: On larger files, rsy keeps multiple workers active and sustains 
 
 | Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------:|-------------------:|
-| <span style="color:green"><strong>WINNER: rsy</strong></span> | 15 | 1.00x | - |
+| **rsy ✓** | 15 | 1.00x | - |
 | rsync | 69 | rsy is 4.60x faster | rsy saves 54 ms (78.3%) |
 
 Technical note: With no payload transfer, this reflects metadata scan and change detection cost.
@@ -54,7 +54,7 @@ Technical note: With no payload transfer, this reflects metadata scan and change
 
 | Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------:|-------------------:|
-| <span style="color:green"><strong>WINNER: rsy</strong></span> | 2.3 | 1.00x | - |
+| **rsy ✓** | 2.3 | 1.00x | - |
 | rsync | 45 | rsy is 19.57x faster | rsy saves 42.7 ms (94.9%) |
 
 Technical note: rsy's parallel check path significantly reduces no-op sync latency.
@@ -65,7 +65,7 @@ Technical note: rsy's parallel check path significantly reduces no-op sync laten
 
 | Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------:|-------------------:|
-| <span style="color:green"><strong>WINNER: rsy</strong></span> | 1.4 | 1.00x | - |
+| **rsy ✓** | 1.4 | 1.00x | - |
 | rsync | 44 | rsy is 31.43x faster | rsy saves 42.6 ms (96.8%) |
 
 Technical note: Rolling checksum plus parallel block scanning minimizes both scan and patch time.
