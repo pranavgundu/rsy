@@ -2,7 +2,7 @@ use crate::transport::daemon::DEFAULT_PORT;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "rsy", about = "Fast parallel file synchronizer")]
+#[command(name = "rsy", about = "A blazing fast parallel copy tool for Unix")]
 pub struct Cli {
     /// Source  (local or user@host:path)
     pub src: String,

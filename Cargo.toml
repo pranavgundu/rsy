@@ -2,7 +2,7 @@
 name = "rsy"
 version = "1.0.0"
 edition = "2024"
-description = "Fast rsync-compatible file synchronization tool written in Rust"
+description = "A blazing fast parallel copy tool for Unix"
 license = "MIT"
 repository = "https://github.com/pranavgundu/rsy"
 keywords = ["rsync", "sync", "file-transfer", "backup", "delta"]

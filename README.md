@@ -1,6 +1,6 @@
 # rsy
 
-Fast parallel file synchronizer. Drop-in `rsync` replacement written in Rust.
+A blazing fast parallel copy tool for Unix.
 
 ## Benchmarks
 

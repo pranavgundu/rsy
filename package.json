@@ -1,7 +1,7 @@
 {
   "name": "@gundu/rsy",
   "version": "1.0.0",
-  "description": "Fast parallel file synchronizer (rsync alternative)",
+  "description": "A blazing fast parallel copy tool for Unix",
   "license": "MIT",
   "repository": "https://github.com/pranavgundu/rsy",
   "homepage": "https://github.com/pranavgundu/rsy",
