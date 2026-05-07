@@ -12,13 +12,12 @@
 
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 // ─── corpus generation ───────────────────────────────────────────────────────
@@ -26,6 +25,7 @@ use tempfile::TempDir;
 struct Corpus {
     _src_dir: TempDir,
     src: PathBuf,
+    #[allow(dead_code)]
     total_bytes: u64,
 }
 
