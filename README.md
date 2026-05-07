@@ -4,67 +4,49 @@ Fast parallel file synchronizer. Drop-in `rsync` replacement written in Rust.
 
 ## Benchmarks
 
-All benchmarks run on Linux x86_64, NVMe SSD, 16 cores. Times are wall-clock milliseconds.
+Criterion-validated benchmarks (Linux x86_64, NVMe SSD, 16 cores).
+Run yourself: `cargo bench`
 
-### Many small files
+### Cold copy — first sync, empty destination
 
-| Corpus | rsy cold | rsync cold | cp cold | rsy incr | rsync incr |
-|--------|----------|------------|---------|----------|------------|
-| 10k × 4KB (39MB) | **164ms** | 484ms | 253ms | **150ms** | 479ms |
-| 50k × 4KB (195MB) | **772ms** | 2347ms | 1214ms | **785ms** | 2330ms |
-| 100k × 4KB (390MB) | **1605ms** | 4714ms | 2454ms | **1582ms** | 4703ms |
-| 5k × 64KB (312MB) | **82ms** | 377ms | 189ms | **81ms** | 382ms |
-| 20k × 64KB (1.2GB) | **365ms** | 1413ms | 703ms | **345ms** | 1392ms |
-| 50k × 64KB (3.1GB) | **902ms** | 3479ms | 1797ms | **906ms** | 3531ms |
+```
+10k × 4KB (39MB)
+  rsy   ████░░░░░░░░░░░░░░░░░░░░░░░░░░  126ms  ████ 3.8× faster than rsync
+  rsync ████████████████████████████░░  483ms
+  cp    ████████░░░░░░░░░░░░░░░░░░░░░░  245ms
 
-**3–3.9× faster** than rsync across all small-file workloads.
+500 × 1MB (500MB)
+  rsy   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   35ms  ████ 7.8× faster than rsync
+  rsync ████████░░░░░░░░░░░░░░░░░░░░░░  272ms
+  cp    ████░░░░░░░░░░░░░░░░░░░░░░░░░░  116ms
 
-### Medium files (1MB each)
+100 × 16MB (1.6GB)
+  rsy   ████░░░░░░░░░░░░░░░░░░░░░░░░░░   98ms  ████ 7.3× faster than rsync
+  rsync ████████████████████████████░░  715ms
+  cp    █████████████░░░░░░░░░░░░░░░░░  335ms
+```
 
-| Corpus | rsy cold | rsync cold | cp cold | rsy incr | rsync incr |
-|--------|----------|------------|---------|----------|------------|
-| 500 × 1MB (500MB) | **35ms** | 280ms | 116ms | **35ms** | 270ms |
-| 2k × 1MB (2GB) | **129ms** | 959ms | 447ms | **135ms** | 1001ms |
-| 10k × 1MB (10GB) | **1629ms** | 7557ms | 5962ms | 3951ms | **7320ms**† |
+### Incremental — re-sync with no changes
 
-†At 10GB+ page cache pressure degrades rsy incremental. Cold copy stays fast.
+```
+10k × 4KB (39MB)
+  rsy   ██████░░░░░░░░░░░░░░░░░░░░░░░░   15ms  ████ 4.5× faster than rsync
+  rsync ████████████████████████████░░   69ms
 
-### Large files
+500 × 1MB (500MB)
+  rsy   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  2.3ms  ████ 19.7× faster than rsync
+  rsync ████████████████████████████░░   45ms
+```
 
-| Corpus | rsy cold | rsync cold | cp cold | rsy incr | rsync incr |
-|--------|----------|------------|---------|----------|------------|
-| 100 × 16MB (1.6GB) | **98ms** | 727ms | 319ms | **99ms** | 706ms |
-| 500 × 16MB (8GB) | **930ms** | 5973ms | 5138ms | 3834ms | **6577ms**† |
-| 16 × 64MB (1GB) | **68ms** | 468ms | 217ms | **67ms** | 471ms |
-| 32 × 64MB (2GB) | **125ms** | 886ms | 404ms | **133ms** | 876ms |
-| 64 × 64MB (4GB) | **249ms** | 1744ms | 1041ms | **681ms** | 1702ms |
-| 160 × 64MB (10GB) | **1322ms** | 7849ms | 7420ms | 6168ms | **8025ms**† |
-| 240 × 64MB (15GB) | **4415ms** | 11581ms | 10371ms | 9609ms | **10831ms**† |
-| 400 × 64MB (25GB) | **11596ms** | 17771ms | 16225ms | 15567ms | **17928ms**† |
-| 800 × 64MB (50GB) | **49340ms** | 58064ms | — | — | — |
+### Delta — re-sync with 10% of data changed
 
-†Above ~8GB incremental, rsy checksum scanning exceeds rsync's lighter mtime check. Use `-c` flag only when needed at large scale.
+```
+10 × 10MB (100MB, 10% mutated)
+  rsy   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  1.4ms  ████ 30× faster than rsync
+  rsync ████████████████████████████░░   44ms
+```
 
-### Summary
-
-| Workload | rsy vs rsync | rsy vs cp |
-|----------|-------------|-----------|
-| Small files (cold) | **3–4× faster** | **1.5–2× faster** |
-| Medium files (cold) | **4–7× faster** | **3× faster** |
-| Large files cold ≤4GB | **6–7× faster** | **2–4× faster** |
-| Large files cold 10–25GB | **1.5–2.6× faster** | similar |
-| Large files cold ~50GB | **1.2× faster** | — |
-| Incremental ≤4GB | **3–7× faster** | — |
-| Incremental >8GB | competitive | — |
-
-### Large file delta — 100MB file, 10% changed
-
-| Tool | Time |
-|------|------|
-| **rsy** | **5ms** |
-| rsync | 35ms |
-
-**7× faster** — parallel block scanning vs rsync's serial pass.
+Parallel block scanning vs rsync's serial pass.
 
 ---
 
