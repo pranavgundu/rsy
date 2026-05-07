@@ -726,12 +726,9 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
 
         let mut lit: usize = 0;
         let mut mat: usize = 0;
-        let mut new_data = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0));
-        // Cap total reconstructed size to prevent memory exhaustion from a
-        // malicious sender sending many tokens that each pass the per-token cap.
-        let max_reconstructed = (entry.size as usize)
-            .saturating_mul(2)
-            .max(512 * 1024 * 1024);
+        let max_reconstructed: usize = 2 * 1024 * 1024 * 1024; // 2 GiB hard cap, not sender-controlled
+        let capacity = usize::try_from(entry.size).unwrap_or(0).min(max_reconstructed);
+        let mut new_data = Vec::with_capacity(capacity);
         loop {
             match read_token(&mut *pipe.rx)? {
                 None => break,

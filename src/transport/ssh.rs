@@ -13,8 +13,20 @@ pub fn connect(host: &str, remote_path: &str, sender_side: bool) -> Result<Pipe>
         anyhow::bail!("RSY_REMOTE_BIN contains unsafe characters: {rsy_remote:?}");
     }
 
+    // Reject hosts that start with '-' to prevent flag injection, and hosts
+    // containing shell metacharacters that could escape the remote command.
+    if host.starts_with('-') {
+        anyhow::bail!("host looks like an ssh flag: {host:?}");
+    }
+    if host
+        .chars()
+        .any(|c| matches!(c, '`' | '$' | '\\' | '\'' | '"' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | '\n' | '\r'))
+    {
+        anyhow::bail!("host contains unsafe characters: {host:?}");
+    }
+
     let mut cmd = Command::new("ssh");
-    cmd.args(["-e", "none", host, &rsy_remote, "--server"]);
+    cmd.args(["-e", "none", "--", host, &rsy_remote, "--server"]);
     if sender_side {
         cmd.arg("--sender");
     }
