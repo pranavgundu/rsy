@@ -18,10 +18,12 @@ pub fn connect(host: &str, remote_path: &str, sender_side: bool) -> Result<Pipe>
     if host.starts_with('-') {
         anyhow::bail!("host looks like an ssh flag: {host:?}");
     }
-    if host
-        .chars()
-        .any(|c| matches!(c, '`' | '$' | '\\' | '\'' | '"' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | '\n' | '\r'))
-    {
+    if host.chars().any(|c| {
+        matches!(
+            c,
+            '`' | '$' | '\\' | '\'' | '"' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | '\n' | '\r'
+        )
+    }) {
         anyhow::bail!("host contains unsafe characters: {host:?}");
     }
 
