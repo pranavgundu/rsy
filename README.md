@@ -7,46 +7,70 @@ Fast parallel file synchronizer. Drop-in `rsync` replacement written in Rust.
 Criterion-validated benchmarks (Linux x86_64, NVMe SSD, 16 cores).
 Run yourself: `cargo bench`
 
-### Cold copy — first sync, empty destination
+### Cold copy - first sync, empty destination
 
-```
-10k × 4KB (39MB)
-  rsy   ████░░░░░░░░░░░░░░░░░░░░░░░░░░  126ms  ████ 3.8× faster than rsync
-  rsync ████████████████████████████░░  483ms
-  cp    ████████░░░░░░░░░░░░░░░░░░░░░░  245ms
+#### 10k files x 4KB (39MB total)
 
-500 × 1MB (500MB)
-  rsy   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   35ms  ████ 7.8× faster than rsync
-  rsync ████████░░░░░░░░░░░░░░░░░░░░░░  272ms
-  cp    ████░░░░░░░░░░░░░░░░░░░░░░░░░░  116ms
+| Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
+|------|----------:|----------------------------:|----------------:|-------------------:|
+| GREEN: rsy | 126 | 309.5 | 1.00x | - |
+| rsync | 483 | 80.7 | rsy is 3.83x faster | rsy saves 357 ms (73.9%) |
+| cp | 245 | 159.2 | rsy is 1.94x faster | rsy saves 119 ms (48.6%) |
 
-100 × 16MB (1.6GB)
-  rsy   ████░░░░░░░░░░░░░░░░░░░░░░░░░░   98ms  ████ 7.3× faster than rsync
-  rsync ████████████████████████████░░  715ms
-  cp    █████████████░░░░░░░░░░░░░░░░░  335ms
-```
+Technical note: Small-file workloads are metadata and syscall heavy; rsy benefits from parallel file traversal and copy scheduling.
 
-### Incremental — re-sync with no changes
+#### 500 files x 1MB (500MB total)
 
-```
-10k × 4KB (39MB)
-  rsy   ██████░░░░░░░░░░░░░░░░░░░░░░░░   15ms  ████ 4.5× faster than rsync
-  rsync ████████████████████████████░░   69ms
+| Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
+|------|----------:|----------------------------:|----------------:|-------------------:|
+| GREEN: rsy | 35 | 14285.7 | 1.00x | - |
+| rsync | 272 | 1838.2 | rsy is 7.77x faster | rsy saves 237 ms (87.1%) |
+| cp | 116 | 4310.3 | rsy is 3.31x faster | rsy saves 81 ms (69.8%) |
 
-500 × 1MB (500MB)
-  rsy   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  2.3ms  ████ 19.7× faster than rsync
-  rsync ████████████████████████████░░   45ms
-```
+Technical note: Parallel I/O and lower per-file overhead produce a large latency win.
 
-### Delta — re-sync with 10% of data changed
+#### 100 files x 16MB (1.6GB total)
 
-```
-10 × 10MB (100MB, 10% mutated)
-  rsy   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  1.4ms  ████ 30× faster than rsync
-  rsync ████████████████████████████░░   44ms
-```
+| Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
+|------|----------:|----------------------------:|----------------:|-------------------:|
+| GREEN: rsy | 98 | 16326.5 | 1.00x | - |
+| rsync | 715 | 2237.8 | rsy is 7.30x faster | rsy saves 617 ms (86.3%) |
+| cp | 335 | 4776.1 | rsy is 3.42x faster | rsy saves 237 ms (70.7%) |
 
-Parallel block scanning vs rsync's serial pass.
+Technical note: On larger files, rsy keeps multiple workers active and sustains higher end-to-end throughput.
+
+### Incremental - re-sync with no changes
+
+#### 10k files x 4KB (39MB total)
+
+| Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
+|------|----------:|----------------:|-------------------:|
+| GREEN: rsy | 15 | 1.00x | - |
+| rsync | 69 | rsy is 4.60x faster | rsy saves 54 ms (78.3%) |
+
+Technical note: With no payload transfer, this reflects metadata scan and change detection cost.
+
+#### 500 files x 1MB (500MB total)
+
+| Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
+|------|----------:|----------------:|-------------------:|
+| GREEN: rsy | 2.3 | 1.00x | - |
+| rsync | 45 | rsy is 19.57x faster | rsy saves 42.7 ms (94.9%) |
+
+Technical note: rsy's parallel check path significantly reduces no-op sync latency.
+
+### Delta - re-sync with 10% of data changed
+
+#### 10 files x 10MB (100MB total, 10% mutated)
+
+| Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
+|------|----------:|----------------:|-------------------:|
+| GREEN: rsy | 1.4 | 1.00x | - |
+| rsync | 44 | rsy is 31.43x faster | rsy saves 42.6 ms (96.8%) |
+
+Technical note: Rolling checksum plus parallel block scanning minimizes both scan and patch time.
+
+Overall: In this benchmark set, rsy wins every case. Speedup vs rsync ranges from 3.83x to 31.43x.
 
 ---
 
