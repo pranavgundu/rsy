@@ -144,8 +144,16 @@ fn cold_sync_bench(c: &mut Criterion, spec: CorpusSpec) {
     let corpus = generate_corpus(&spec);
     let mut group = c.benchmark_group(format!("cold/{}", spec.label));
     group.throughput(Throughput::Bytes(spec.total_bytes()));
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(30));
+    // Large corpora: minimum samples, generous time window
+    let (samples, secs) = if spec.total_bytes() >= 10 * 1024 * 1024 * 1024 {
+        (3, 600)
+    } else if spec.total_bytes() >= 1024 * 1024 * 1024 {
+        (5, 120)
+    } else {
+        (10, 30)
+    };
+    group.sample_size(samples);
+    group.measurement_time(Duration::from_secs(secs));
 
     group.bench_function("rsy", |b| {
         b.iter_custom(|iters| {
@@ -241,58 +249,223 @@ fn delta_bench(c: &mut Criterion, spec: CorpusSpec) {
 
 // ─── benchmark definitions ────────────────────────────────────────────────────
 
-const SMALL_FILES: CorpusSpec = CorpusSpec {
+// ── small ──────────────────────────────────────────────────────────────────
+
+const S_10K_4KB: CorpusSpec = CorpusSpec {
     label: "10k-files-4KB",
     file_count: 10_000,
     file_size: 4_096,
     depth: 3,
 };
+const S_50K_4KB: CorpusSpec = CorpusSpec {
+    label: "50k-files-4KB",
+    file_count: 50_000,
+    file_size: 4_096,
+    depth: 4,
+};
+const S_100K_4KB: CorpusSpec = CorpusSpec {
+    label: "100k-files-4KB",
+    file_count: 100_000,
+    file_size: 4_096,
+    depth: 4,
+};
 
-const MEDIUM_FILES: CorpusSpec = CorpusSpec {
+// ── medium ─────────────────────────────────────────────────────────────────
+
+const M_500_1MB: CorpusSpec = CorpusSpec {
     label: "500-files-1MB",
     file_count: 500,
     file_size: 1_048_576,
     depth: 2,
 };
+const M_2K_1MB: CorpusSpec = CorpusSpec {
+    label: "2k-files-1MB",
+    file_count: 2_000,
+    file_size: 1_048_576,
+    depth: 2,
+};
+const M_10K_1MB: CorpusSpec = CorpusSpec {
+    label: "10k-files-1MB",
+    file_count: 10_000,
+    file_size: 1_048_576,
+    depth: 3,
+};
 
-const LARGE_FILES: CorpusSpec = CorpusSpec {
+// ── large ──────────────────────────────────────────────────────────────────
+
+const L_100_16MB: CorpusSpec = CorpusSpec {
     label: "100-files-16MB",
     file_count: 100,
     file_size: 16_777_216,
     depth: 1,
 };
+const L_500_16MB: CorpusSpec = CorpusSpec {
+    label: "500-files-16MB",
+    file_count: 500,
+    file_size: 16_777_216,
+    depth: 2,
+};
+const L_16_64MB: CorpusSpec = CorpusSpec {
+    label: "16-files-64MB",
+    file_count: 16,
+    file_size: 67_108_864,
+    depth: 1,
+}; // ~1GB
+const L_32_64MB: CorpusSpec = CorpusSpec {
+    label: "32-files-64MB",
+    file_count: 32,
+    file_size: 67_108_864,
+    depth: 1,
+}; // ~2GB
+const L_64_64MB: CorpusSpec = CorpusSpec {
+    label: "64-files-64MB",
+    file_count: 64,
+    file_size: 67_108_864,
+    depth: 2,
+}; // ~4GB
+const L_160_64MB: CorpusSpec = CorpusSpec {
+    label: "160-files-64MB",
+    file_count: 160,
+    file_size: 67_108_864,
+    depth: 2,
+}; // ~10GB
+const L_240_64MB: CorpusSpec = CorpusSpec {
+    label: "240-files-64MB",
+    file_count: 240,
+    file_size: 67_108_864,
+    depth: 2,
+}; // ~15GB
+const L_400_64MB: CorpusSpec = CorpusSpec {
+    label: "400-files-64MB",
+    file_count: 400,
+    file_size: 67_108_864,
+    depth: 3,
+}; // ~25GB
+const L_640_64MB: CorpusSpec = CorpusSpec {
+    label: "640-files-64MB",
+    file_count: 640,
+    file_size: 67_108_864,
+    depth: 3,
+}; // ~40GB
+const L_800_64MB: CorpusSpec = CorpusSpec {
+    label: "800-files-64MB",
+    file_count: 800,
+    file_size: 67_108_864,
+    depth: 3,
+}; // ~50GB
+const L_1600_64MB: CorpusSpec = CorpusSpec {
+    label: "1600-files-64MB",
+    file_count: 1_600,
+    file_size: 67_108_864,
+    depth: 4,
+}; // ~100GB
+
+// ── delta ──────────────────────────────────────────────────────────────────
 
 const DELTA_CORPUS: CorpusSpec = CorpusSpec {
     label: "delta-10pct-changed",
     file_count: 10,
-    file_size: 10_485_760, // 10MB each → 100MB total
+    file_size: 10_485_760,
     depth: 0,
 };
 
-fn bench_cold_small(c: &mut Criterion) {
-    cold_sync_bench(c, SMALL_FILES);
+// ── bench fns ─────────────────────────────────────────────────────────────
+
+fn bench_cold_10k_4kb(c: &mut Criterion) {
+    cold_sync_bench(c, S_10K_4KB);
 }
-fn bench_cold_medium(c: &mut Criterion) {
-    cold_sync_bench(c, MEDIUM_FILES);
+fn bench_cold_50k_4kb(c: &mut Criterion) {
+    cold_sync_bench(c, S_50K_4KB);
 }
-fn bench_cold_large(c: &mut Criterion) {
-    cold_sync_bench(c, LARGE_FILES);
+fn bench_cold_100k_4kb(c: &mut Criterion) {
+    cold_sync_bench(c, S_100K_4KB);
 }
-fn bench_incremental_small(c: &mut Criterion) {
-    incremental_bench(c, SMALL_FILES);
+fn bench_cold_500_1mb(c: &mut Criterion) {
+    cold_sync_bench(c, M_500_1MB);
 }
-fn bench_incremental_medium(c: &mut Criterion) {
-    incremental_bench(c, MEDIUM_FILES);
+fn bench_cold_2k_1mb(c: &mut Criterion) {
+    cold_sync_bench(c, M_2K_1MB);
 }
+fn bench_cold_10k_1mb(c: &mut Criterion) {
+    cold_sync_bench(c, M_10K_1MB);
+}
+fn bench_cold_100_16mb(c: &mut Criterion) {
+    cold_sync_bench(c, L_100_16MB);
+}
+fn bench_cold_500_16mb(c: &mut Criterion) {
+    cold_sync_bench(c, L_500_16MB);
+}
+fn bench_cold_1gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_16_64MB);
+}
+fn bench_cold_2gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_32_64MB);
+}
+fn bench_cold_4gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_64_64MB);
+}
+fn bench_cold_10gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_160_64MB);
+}
+fn bench_cold_15gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_240_64MB);
+}
+fn bench_cold_25gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_400_64MB);
+}
+fn bench_cold_40gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_640_64MB);
+}
+fn bench_cold_50gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_800_64MB);
+}
+fn bench_cold_100gb(c: &mut Criterion) {
+    cold_sync_bench(c, L_1600_64MB);
+}
+
+fn bench_incr_10k_4kb(c: &mut Criterion) {
+    incremental_bench(c, S_10K_4KB);
+}
+fn bench_incr_500_1mb(c: &mut Criterion) {
+    incremental_bench(c, M_500_1MB);
+}
+fn bench_incr_1gb(c: &mut Criterion) {
+    incremental_bench(c, L_16_64MB);
+}
+fn bench_incr_10gb(c: &mut Criterion) {
+    incremental_bench(c, L_160_64MB);
+}
+
 fn bench_delta(c: &mut Criterion) {
     delta_bench(c, DELTA_CORPUS);
 }
 
-criterion_group!(cold, bench_cold_small, bench_cold_medium, bench_cold_large);
+criterion_group!(
+    cold,
+    bench_cold_10k_4kb,
+    bench_cold_50k_4kb,
+    bench_cold_100k_4kb,
+    bench_cold_500_1mb,
+    bench_cold_2k_1mb,
+    bench_cold_10k_1mb,
+    bench_cold_100_16mb,
+    bench_cold_500_16mb,
+    bench_cold_1gb,
+    bench_cold_2gb,
+    bench_cold_4gb,
+    bench_cold_10gb,
+    bench_cold_15gb,
+    bench_cold_25gb,
+    bench_cold_40gb,
+    bench_cold_50gb,
+    bench_cold_100gb
+);
 criterion_group!(
     incremental,
-    bench_incremental_small,
-    bench_incremental_medium
+    bench_incr_10k_4kb,
+    bench_incr_500_1mb,
+    bench_incr_1gb,
+    bench_incr_10gb
 );
 criterion_group!(delta, bench_delta);
 
