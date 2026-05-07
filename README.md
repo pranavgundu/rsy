@@ -11,6 +11,10 @@ Run yourself: `cargo bench`
 
 #### 10k files x 4KB (39MB total)
 
+```sh
+rsy src/ dst/
+```
+
 | Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------------------:|----------------:|-------------------:|
 | **rsy ✓** | 126 | 309.5 | 1.00x | - |
@@ -21,6 +25,10 @@ Technical note: Small-file workloads are metadata and syscall heavy; rsy benefit
 
 #### 500 files x 1MB (500MB total)
 
+```sh
+rsy src/ dst/
+```
+
 | Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------------------:|----------------:|-------------------:|
 | **rsy ✓** | 35 | 14285.7 | 1.00x | - |
@@ -30,6 +38,10 @@ Technical note: Small-file workloads are metadata and syscall heavy; rsy benefit
 Technical note: Parallel I/O and lower per-file overhead produce a large latency win.
 
 #### 100 files x 16MB (1.6GB total)
+
+```sh
+rsy src/ dst/
+```
 
 | Tool | Time (ms) | Effective Throughput (MB/s) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------------------:|----------------:|-------------------:|
@@ -43,6 +55,10 @@ Technical note: On larger files, rsy keeps multiple workers active and sustains 
 
 #### 10k files x 4KB (39MB total)
 
+```sh
+rsy src/ dst/   # re-run, nothing changed
+```
+
 | Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------:|-------------------:|
 | **rsy ✓** | 15 | 1.00x | - |
@@ -51,6 +67,10 @@ Technical note: On larger files, rsy keeps multiple workers active and sustains 
 Technical note: With no payload transfer, this reflects metadata scan and change detection cost.
 
 #### 500 files x 1MB (500MB total)
+
+```sh
+rsy src/ dst/   # re-run, nothing changed
+```
 
 | Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------:|-------------------:|
@@ -62,6 +82,10 @@ Technical note: rsy's parallel check path significantly reduces no-op sync laten
 ### Delta - re-sync with 10% of data changed
 
 #### 10 files x 10MB (100MB total, 10% mutated)
+
+```sh
+rsy src/ dst/   # re-run after partial changes
+```
 
 | Tool | Time (ms) | Relative to rsy | Time Saved vs Tool |
 |------|----------:|----------------:|-------------------:|
