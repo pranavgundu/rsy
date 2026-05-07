@@ -195,9 +195,7 @@ fn incremental_bench(c: &mut Criterion, spec: CorpusSpec) {
     run_rsy(&corpus.src, dst_rsy.path());
     run_rsync(&corpus.src, dst_rsync.path());
 
-    group.bench_function("rsy", |b| {
-        b.iter(|| run_rsy(&corpus.src, dst_rsy.path()))
-    });
+    group.bench_function("rsy", |b| b.iter(|| run_rsy(&corpus.src, dst_rsy.path())));
 
     group.bench_function("rsync", |b| {
         b.iter(|| run_rsync(&corpus.src, dst_rsync.path()))
@@ -232,9 +230,7 @@ fn delta_bench(c: &mut Criterion, spec: CorpusSpec) {
         }
     }
 
-    group.bench_function("rsy", |b| {
-        b.iter(|| run_rsy(&corpus.src, dst_rsy.path()))
-    });
+    group.bench_function("rsy", |b| b.iter(|| run_rsy(&corpus.src, dst_rsy.path())));
 
     group.bench_function("rsync", |b| {
         b.iter(|| run_rsync(&corpus.src, dst_rsync.path()))
@@ -292,12 +288,7 @@ fn bench_delta(c: &mut Criterion) {
     delta_bench(c, DELTA_CORPUS);
 }
 
-criterion_group!(
-    cold,
-    bench_cold_small,
-    bench_cold_medium,
-    bench_cold_large
-);
+criterion_group!(cold, bench_cold_small, bench_cold_medium, bench_cold_large);
 criterion_group!(
     incremental,
     bench_incremental_small,
