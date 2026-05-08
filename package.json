@@ -5,7 +5,13 @@
   "license": "MIT",
   "repository": "https://github.com/pranavgundu/rsy",
   "homepage": "https://github.com/pranavgundu/rsy",
-  "keywords": ["rsync", "sync", "file-transfer", "backup", "cli"],
+  "keywords": [
+    "rsync",
+    "sync",
+    "file-transfer",
+    "backup",
+    "cli"
+  ],
   "bin": {
     "rsy": "bin/rsy.js"
   },
@@ -13,11 +19,11 @@
     "postinstall": "node install.js"
   },
   "optionalDependencies": {
-    "@gundu/rsy-linux-x64":    "1.1.2",
-    "@gundu/rsy-linux-arm64":  "1.1.2",
-    "@gundu/rsy-darwin-x64":   "1.1.2",
+    "@gundu/rsy-linux-x64": "1.1.2",
+    "@gundu/rsy-linux-arm64": "1.1.2",
+    "@gundu/rsy-darwin-x64": "1.1.2",
     "@gundu/rsy-darwin-arm64": "1.1.2",
-    "@gundu/rsy-win32-x64":    "1.1.2"
+    "@gundu/rsy-win32-x64": "1.1.2"
   },
   "files": [
     "bin/",

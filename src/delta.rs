@@ -31,14 +31,6 @@ pub fn basis_sums(data: &[u8], blen: usize) -> Vec<BlockSum> {
     }
 }
 
-/// Sender-side token. Borrows literal runs directly from `src` — zero copy.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum SrcToken<'a> {
-    Copy { offset: u64, len: u32 },
-    Data(&'a [u8]),
-}
-
 /// Streaming sink for tokens. Sender side writes wire format; local patch path
 /// writes reconstructed bytes to disk.
 pub trait TokenSink {
@@ -341,6 +333,30 @@ mod tests {
         let (lit, _) = token_stats(&tokens);
         assert_eq!(lit, 0);
         round_trip(&src, &basis, blen);
+    }
+
+    #[test]
+    fn basis_sums_rejects_zero_block_size() {
+        assert!(basis_sums(b"data", 0).is_empty());
+    }
+
+    #[test]
+    fn basis_sums_keeps_final_partial_block_offset() {
+        let sums = basis_sums(b"abcdefghi", 4);
+
+        assert_eq!(sums.len(), 3);
+        assert_eq!(sums[0].offset, 0);
+        assert_eq!(sums[1].offset, 4);
+        assert_eq!(sums[2].offset, 8);
+    }
+
+    #[test]
+    fn exact_block_sized_file_round_trips() {
+        let basis = b"abcdefgh".repeat(8);
+        let mut src = basis.clone();
+        src.extend_from_slice(&basis);
+
+        round_trip(&src, &basis, 8);
     }
 
     #[test]

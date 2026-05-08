@@ -245,6 +245,8 @@ mod tests {
     #[test]
     fn parse_size_units() {
         assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size(" 5k ").unwrap(), 5 * 1024);
+        assert_eq!(parse_size("7B").unwrap(), 7);
         assert_eq!(parse_size("1K").unwrap(), 1024);
         assert_eq!(parse_size("2M").unwrap(), 2 * 1024 * 1024);
         assert_eq!(parse_size("3G").unwrap(), 3 * 1024 * 1024 * 1024);
@@ -319,5 +321,29 @@ mod tests {
         assert!(f.allow(Path::new("dist"), false));
         // but contents of dir named dist are excluded
         assert!(!f.allow(Path::new("dist/bundle.js"), false));
+    }
+
+    #[test]
+    fn filter_load_from_file_ignores_blanks_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("exclude.txt");
+        std::fs::write(&file, "\n# comment\n*.tmp\n cache/ \n").unwrap();
+
+        let mut f = FilterList::default();
+        f.load_from_file(RuleKind::Exclude, file.to_str().unwrap())
+            .unwrap();
+
+        assert!(!f.allow(Path::new("scratch.tmp"), false));
+        assert!(!f.allow(Path::new("cache/data.bin"), false));
+        assert!(f.allow(Path::new("src/main.rs"), false));
+    }
+
+    #[test]
+    fn filter_first_matching_rule_wins_for_includes_and_excludes() {
+        let mut f = FilterList::default();
+        f.add_exclude("*.txt");
+        f.add_include("keep.txt");
+
+        assert!(!f.allow(Path::new("keep.txt"), false));
     }
 }

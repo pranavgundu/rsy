@@ -350,3 +350,80 @@ fn split_daemon(s: &str) -> Option<(String, u16, String)> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn parse_mode_detects_local_copy() {
+        let cli = cli(&["rsy", "src", "dst"]);
+        assert!(matches!(
+            parse_mode(&cli),
+            Mode::Local { src, dst } if src == "src" && dst == "dst"
+        ));
+    }
+
+    #[test]
+    fn parse_mode_detects_ssh_push() {
+        let cli = cli(&["rsy", "src", "example.com:/srv/data"]);
+        assert!(matches!(
+            parse_mode(&cli),
+            Mode::SshPush { host, src, remote_dst }
+                if host == "example.com" && src == "src" && remote_dst == "/srv/data"
+        ));
+    }
+
+    #[test]
+    fn parse_mode_detects_ssh_pull() {
+        let cli = cli(&["rsy", "user@example.com:/srv/data", "dst"]);
+        assert!(matches!(
+            parse_mode(&cli),
+            Mode::SshPull { host, remote_src, dst }
+                if host == "user@example.com" && remote_src == "/srv/data" && dst == "dst"
+        ));
+    }
+
+    #[test]
+    fn parse_mode_detects_server_sender() {
+        let cli = cli(&["rsy", "--server", "--sender", "/tmp/src"]);
+        assert!(matches!(
+            parse_mode(&cli),
+            Mode::Server { sender_side: true, path } if path == "/tmp/src"
+        ));
+    }
+
+    #[test]
+    fn parse_mode_detects_rsync_url_daemon() {
+        let cli = cli(&["rsy", "src", "rsync://example.com:10873/module/path"]);
+        assert!(matches!(
+            parse_mode(&cli),
+            Mode::Daemon { host, port, src, dst }
+                if host == "example.com" && port == 10873 && src == "src" && dst == "/module/path"
+        ));
+    }
+
+    #[test]
+    fn parse_mode_detects_module_daemon() {
+        let cli = cli(&["rsy", "src", "example.com::module/path"]);
+        assert!(matches!(
+            parse_mode(&cli),
+            Mode::Daemon { host, port, src, dst }
+                if host == "example.com" && port == DEFAULT_PORT && src == "src" && dst == "module/path"
+        ));
+    }
+
+    #[test]
+    fn split_remote_rejects_empty_host() {
+        assert!(split_remote(":/tmp").is_none());
+    }
+
+    #[test]
+    fn split_daemon_rejects_bad_port() {
+        assert!(split_daemon("rsync://example.com:notaport/module").is_none());
+    }
+}

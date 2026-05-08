@@ -1223,6 +1223,70 @@ mod tests {
     }
 
     #[test]
+    fn sync_min_size_skips_small_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("small.txt"), b"hi").unwrap();
+        fs::write(src.path().join("large.bin"), vec![0u8; 1024]).unwrap();
+
+        let opts = SyncOpts {
+            min_size: Some(100),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert!(!dst.path().join("small.txt").exists());
+        assert!(dst.path().join("large.bin").exists());
+    }
+
+    #[test]
+    fn sync_update_preserves_newer_destination() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let src_file = src.path().join("file.txt");
+        let dst_file = dst.path().join("file.txt");
+        fs::write(&src_file, b"old source").unwrap();
+        fs::write(&dst_file, b"new destination").unwrap();
+
+        let old = filetime::FileTime::from_unix_time(1_000, 0);
+        let new = filetime::FileTime::from_unix_time(2_000, 0);
+        filetime::set_file_mtime(&src_file, old).unwrap();
+        filetime::set_file_mtime(&dst_file, new).unwrap();
+
+        let opts = SyncOpts {
+            update: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        let stats = sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert_eq!(stats.files_xferred, 0);
+        assert_eq!(fs::read(dst_file).unwrap(), b"new destination");
+    }
+
+    #[test]
+    fn sync_whole_file_replaces_existing_content() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("file.txt"), b"replacement content").unwrap();
+        fs::write(dst.path().join("file.txt"), b"old").unwrap();
+
+        let opts = SyncOpts {
+            whole_file: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        let stats = sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert_eq!(stats.files_xferred, 1);
+        assert_eq!(
+            fs::read(dst.path().join("file.txt")).unwrap(),
+            b"replacement content"
+        );
+    }
+
+    #[test]
     fn sync_broken_symlink_does_not_crash() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();

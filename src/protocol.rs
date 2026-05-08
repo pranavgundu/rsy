@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::delta::Token;
-use crate::delta::{SrcToken, TokenSink};
+use crate::delta::TokenSink;
 use crate::flist::{EntryKind, FileEntry};
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 /// Wire protocol for network (SSH / daemon) mode.
@@ -247,18 +247,6 @@ impl<'w, W: Write> TokenSink for WireSink<'w, W> {
     }
     fn on_data(&mut self, bytes: &[u8]) -> io::Result<()> {
         write_data_tokens(self.0, bytes, MAX_TOKEN_DATA)
-    }
-}
-
-#[allow(dead_code)]
-pub fn write_src_token<W: Write>(w: &mut W, t: &SrcToken<'_>) -> io::Result<()> {
-    match *t {
-        SrcToken::Copy { offset, len } => {
-            w.write_u8(TAG_TOKEN_COPY)?;
-            w.write_u64::<LE>(offset)?;
-            w.write_u32::<LE>(len)
-        }
-        SrcToken::Data(bytes) => write_data_tokens(w, bytes, MAX_TOKEN_DATA),
     }
 }
 
