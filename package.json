@@ -1,6 +1,6 @@
 {
   "name": "@gundu/rsy",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "A blazing fast parallel copy tool for Unix",
   "license": "MIT",
   "repository": "https://github.com/pranavgundu/rsy",
@@ -19,11 +19,11 @@
     "postinstall": "node install.js"
   },
   "optionalDependencies": {
-    "@gundu/rsy-linux-x64": "1.1.2",
-    "@gundu/rsy-linux-arm64": "1.1.2",
-    "@gundu/rsy-darwin-x64": "1.1.2",
-    "@gundu/rsy-darwin-arm64": "1.1.2",
-    "@gundu/rsy-win32-x64": "1.1.2"
+    "@gundu/rsy-linux-x64": "1.1.3",
+    "@gundu/rsy-linux-arm64": "1.1.3",
+    "@gundu/rsy-darwin-x64": "1.1.3",
+    "@gundu/rsy-darwin-arm64": "1.1.3",
+    "@gundu/rsy-win32-x64": "1.1.3"
   },
   "files": [
     "bin/",
