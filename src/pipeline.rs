@@ -617,7 +617,7 @@ fn sync_one(
         return Ok((true, entry.size, 0));
     }
 
-    if (!opts.checksum && entry.size > DELTA_SIZE_LIMIT) || (opts.whole_file && !opts.checksum) {
+    if (opts.whole_file || entry.size > DELTA_SIZE_LIMIT) && !opts.checksum {
         copy_atomic(src, dst)?;
         set_metadata(dst, entry, opts, true)?;
         if opts.verbose {
@@ -947,11 +947,9 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
                 let _ = fs::remove_file(&tmp);
                 fs::write(&dst_path, data)
             })?;
-        } else {
-            if let Err(e) = fs::rename(&tmp, &dst_path) {
-                let _ = fs::remove_file(&tmp);
-                return Err(e.into());
-            }
+        } else if let Err(e) = fs::rename(&tmp, &dst_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
         }
 
         pstats.add(true, lit, mat);
