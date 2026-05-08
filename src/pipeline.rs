@@ -1,41 +1,61 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use memmap2::Mmap;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 
 use crate::checksum::{block_size as auto_block_size, file_hash};
+use crate::delta::{PatchWriter, TokenSink, basis_sums, diff_stream};
+use crate::filter::FilterList;
+use crate::flist::{EntryKind, FileEntry, FileList, device_id};
+use crate::protocol::{
+    ReceiverReq, TAG_FLIST_END, TAG_FLIST_ENTRY, TAG_FLIST_START, WireSink, apply_token_stream,
+    read_entry, read_receiver_req, read_sum_blocks, write_done, write_entry, write_file_hash,
+    write_flist_end, write_flist_start, write_sum_block, write_sum_end, write_sum_head,
+    write_token_end,
+};
+use crate::transport::Pipe;
 
-/// Lexically confine `rel` within `base` — reject `..` traversal and absolute paths.
-fn confine_path(base: &Path, rel: &Path) -> Result<PathBuf> {
-    use std::path::Component;
+// ─── path safety ─────────────────────────────────────────────────────────────
 
+/// Lexically clean a relative path, rejecting absolute paths and `..` traversal.
+/// Does NOT touch the filesystem — caller must validate parents separately
+/// (see `validate_parents`).
+fn clean_rel(rel: &Path) -> Result<PathBuf> {
     if rel.is_absolute() {
-        anyhow::bail!("path traversal: absolute path rejected: {}", rel.display());
+        bail!("path traversal: absolute path rejected: {}", rel.display());
     }
-
-    let mut clean_rel = PathBuf::new();
+    let mut out = PathBuf::new();
     for c in rel.components() {
         match c {
             Component::CurDir => {}
-            Component::Normal(seg) => clean_rel.push(seg),
+            Component::Normal(seg) => out.push(seg),
             Component::ParentDir => {
-                anyhow::bail!("path traversal: '..' is not allowed: {}", rel.display())
+                bail!("path traversal: '..' is not allowed: {}", rel.display())
             }
             Component::RootDir | Component::Prefix(_) => {
-                anyhow::bail!("path traversal: absolute path rejected: {}", rel.display())
+                bail!("path traversal: absolute path rejected: {}", rel.display())
             }
         }
     }
+    Ok(out)
+}
 
-    // Do not allow writes through symlinked ancestor directories.
+/// Lexically confine `rel` within `base`, rejecting any symlinked ancestor in
+/// the destination tree. Single-call helper preserved for tests and code paths
+/// without a pre-validated parent set.
+fn confine_path(base: &Path, rel: &Path) -> Result<PathBuf> {
+    let clean = clean_rel(rel)?;
+
     let mut cur = base.to_path_buf();
-    let mut comps = clean_rel.components().peekable();
+    let mut comps = clean.components().peekable();
     while let Some(c) = comps.next() {
         if let Component::Normal(seg) = c {
             cur.push(seg);
@@ -44,7 +64,7 @@ fn confine_path(base: &Path, rel: &Path) -> Result<PathBuf> {
             }
             match fs::symlink_metadata(&cur) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    anyhow::bail!(
+                    bail!(
                         "path traversal: destination contains symlinked ancestor: {}",
                         cur.display()
                     );
@@ -55,17 +75,38 @@ fn confine_path(base: &Path, rel: &Path) -> Result<PathBuf> {
             }
         }
     }
+    Ok(base.join(clean))
+}
 
-    Ok(base.join(clean_rel))
+/// Walk every parent directory once, in parallel, and reject if any component
+/// is a symlink. After this returns Ok, per-file `confine` calls become a
+/// pure lexical operation — no syscalls.
+fn validate_parents(base: &Path, parents: &HashSet<PathBuf>) -> Result<()> {
+    parents.par_iter().try_for_each(|rel| {
+        let clean = clean_rel(rel)?;
+        let mut cur = base.to_path_buf();
+        for c in clean.components() {
+            if let Component::Normal(seg) = c {
+                cur.push(seg);
+                match fs::symlink_metadata(&cur) {
+                    Ok(meta) if meta.file_type().is_symlink() => bail!(
+                        "path traversal: destination contains symlinked ancestor: {}",
+                        cur.display()
+                    ),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 fn safe_symlink_target(target: &Path) -> bool {
-    use std::path::Component;
-
     if target.is_absolute() {
         return false;
     }
-
     let mut depth = 0usize;
     for c in target.components() {
         match c {
@@ -82,43 +123,28 @@ fn safe_symlink_target(target: &Path) -> bool {
     }
     true
 }
-use crate::delta::{BlockSum, Token, basis_sums, diff, patch, token_stats};
-use crate::filter::FilterList;
-use crate::flist::{EntryKind, FileEntry, FileList, device_id};
-use crate::protocol::{
-    ReceiverReq, TAG_FLIST_END, TAG_FLIST_ENTRY, TAG_FLIST_START, read_entry, read_file_hash,
-    read_receiver_req, read_sum_blocks, read_token, write_done, write_entry, write_file_hash,
-    write_flist_end, write_flist_start, write_sum_block, write_sum_end, write_sum_head,
-    write_token, write_token_end,
-};
-use crate::transport::Pipe;
 
 // ─── options ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncOpts {
-    // transfer control
     pub delete: bool,
-    pub update: bool,          // skip if dst is newer
-    pub ignore_existing: bool, // skip if dst exists
+    pub update: bool,
+    pub ignore_existing: bool,
     pub whole_file: bool,
     pub checksum: bool,
-    pub inplace: bool, // write in-place, no tmp rename
+    pub inplace: bool,
     pub one_file_system: bool,
-    // metadata — preserve_times is kept for CLI compat but mtime is always synced
     #[allow(dead_code)]
     pub preserve_times: bool,
     pub preserve_perms: bool,
     pub preserve_owner: bool,
     pub preserve_group: bool,
-    // filtering
     pub filter: FilterList,
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
-    // algorithm
     pub block_size: Option<usize>,
     pub compress: bool,
-    // output
     pub verbose: bool,
     pub progress: bool,
     pub stats: bool,
@@ -209,14 +235,21 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
         None
     };
 
+    // Only walk dst when --delete needs the dst inventory. Saves a full tree
+    // walk on every cold sync.
     let (src_res, dst_res) = rayon::join(
         || FileList::build(src_root, root_dev),
-        || FileList::build(dst_root, None).or_else(|_| Ok::<_, anyhow::Error>(FileList::empty())),
+        || -> Result<FileList> {
+            if opts.delete {
+                Ok(FileList::build(dst_root, None).unwrap_or_else(|_| FileList::empty()))
+            } else {
+                Ok(FileList::empty())
+            }
+        },
     );
     let src_list = src_res?;
     let dst_list = dst_res?;
 
-    // Apply global filters + size limits to source list
     let src_filtered: Vec<&FileEntry> = src_list
         .0
         .iter()
@@ -238,18 +271,27 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
         })
         .collect();
 
-    // Dirs first — parallel creation; sorted order ensures parents precede children
-    src_filtered
-        .iter()
-        .filter(|e| e.is_dir())
-        .try_for_each(|e| {
-            if opts.dry_run {
-                return Ok::<_, anyhow::Error>(());
-            }
-            let dst = confine_path(dst_root, &e.path)?;
+    // Pre-create directories serially (sorted order ensures parents first).
+    if !opts.dry_run {
+        for e in src_filtered.iter().filter(|e| e.is_dir()) {
+            let dst = dst_root.join(clean_rel(&e.path)?);
             fs::create_dir_all(dst)?;
-            Ok::<_, anyhow::Error>(())
-        })?;
+        }
+    }
+
+    // Pre-validate every parent dir once, in parallel — eliminates the per-file
+    // ancestor symlink walk that used to dominate small-file workloads.
+    if !opts.dry_run {
+        let mut parents: HashSet<PathBuf> = HashSet::new();
+        for e in src_filtered.iter().filter(|e| e.is_regular()) {
+            if let Some(p) = e.path.parent()
+                && !p.as_os_str().is_empty()
+            {
+                parents.insert(p.to_path_buf());
+            }
+        }
+        validate_parents(dst_root, &parents)?;
+    }
 
     // Symlinks
     for e in src_filtered.iter() {
@@ -264,7 +306,7 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
                 );
                 continue;
             }
-            let dst = confine_path(dst_root, &e.path)?;
+            let dst = dst_root.join(clean_rel(&e.path)?);
             let _ = fs::remove_file(&dst);
             if let Some(p) = dst.parent() {
                 fs::create_dir_all(p)?;
@@ -293,7 +335,7 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
 
     regular.into_par_iter().for_each(|entry| {
         let src = src_root.join(&entry.path);
-        let dst = match confine_path(dst_root, &entry.path) {
+        let rel = match clean_rel(&entry.path) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("warning: {}: {e}", entry.path.display());
@@ -301,6 +343,7 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
                 return;
             }
         };
+        let dst = dst_root.join(rel);
         match sync_one(&src, &dst, entry, opts) {
             Ok((xferred, lit, mat)) => {
                 pstats2.add(xferred, lit, mat);
@@ -328,10 +371,8 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
         eprintln!();
     }
 
-    // --delete: remove dst entries absent from src
     if opts.delete {
-        let src_paths: std::collections::HashSet<&PathBuf> =
-            src_list.0.iter().map(|e| &e.path).collect();
+        let src_paths: FxHashSet<&PathBuf> = src_list.0.iter().map(|e| &e.path).collect();
         for e in &dst_list.0 {
             if !src_paths.contains(&e.path) {
                 if opts.dry_run {
@@ -364,14 +405,40 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
 // ─── single file ─────────────────────────────────────────────────────────────
 
 const MMAP_THRESHOLD: u64 = 512 * 1024;
+/// Skip delta entirely above this size — basis mmap + rolling-hash on multi-GB
+/// files would page-fault for longer than a flat clone/copy.
+const DELTA_SIZE_LIMIT: u64 = 512 * 1024 * 1024;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-enum SrcBytes {
+enum Bytes {
     Mmap(Mmap),
     Heap(Vec<u8>),
+    Empty,
 }
 
-fn create_unique_tmp_file(dst: &Path) -> Result<(PathBuf, fs::File)> {
+impl Bytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Mmap(m) => m,
+            Bytes::Heap(v) => v,
+            Bytes::Empty => &[],
+        }
+    }
+}
+
+fn read_for_delta(path: &Path, size: u64) -> Result<Bytes> {
+    if size == 0 {
+        return Ok(Bytes::Empty);
+    }
+    if size >= MMAP_THRESHOLD {
+        let f = fs::File::open(path)?;
+        Ok(Bytes::Mmap(unsafe { Mmap::map(&f)? }))
+    } else {
+        Ok(Bytes::Heap(fs::read(path)?))
+    }
+}
+
+fn unique_tmp(dst: &Path) -> Result<(PathBuf, fs::File)> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     let leaf = dst
         .file_name()
@@ -390,49 +457,106 @@ fn create_unique_tmp_file(dst: &Path) -> Result<(PathBuf, fs::File)> {
             Err(e) => return Err(e.into()),
         }
     }
-    anyhow::bail!("failed to create unique temp file for {}", dst.display())
+    bail!("failed to create unique temp file for {}", dst.display())
 }
 
-fn write_file_atomically(dst: &Path, data: &[u8]) -> Result<()> {
-    let (tmp, mut f) = create_unique_tmp_file(dst)?;
-    let write_res: Result<()> = (|| {
-        f.write_all(data)?;
-        f.flush()?;
+/// macOS APFS clone: O(1) copy-on-write, no data movement. Returns Err on any
+/// platform/filesystem mismatch so callers can fall back.
+#[cfg(target_os = "macos")]
+fn try_clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let s = CString::new(src.as_os_str().as_bytes())?;
+    let d = CString::new(dst.as_os_str().as_bytes())?;
+    let r = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
+    if r == 0 {
         Ok(())
-    })();
-    drop(f);
-    if let Err(e) = write_res {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    if let Err(e) = fs::rename(&tmp, dst) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
 }
 
-fn copy_file_atomically(src: &Path, dst: &Path) -> Result<()> {
-    let (tmp, out) = create_unique_tmp_file(dst)?;
-    drop(out);
-    let copy_res: Result<()> = (|| {
-        fs::copy(src, &tmp)?;
+/// Linux reflink: O(1) copy-on-write on filesystems supporting FICLONE
+/// (Btrfs, XFS reflink, OCFS2, and some overlay setups). Returns Err on
+/// unsupported filesystems so callers can fall back.
+#[cfg(target_os = "linux")]
+fn try_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let src_file = fs::File::open(src)?;
+    let src_meta = src_file.metadata()?;
+    let dst_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(src_meta.permissions().mode())
+        .open(dst)?;
+
+    let rc = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE, src_file.as_raw_fd()) };
+    if rc == 0 {
+        fs::set_permissions(dst, src_meta.permissions())?;
         Ok(())
-    })();
-    if let Err(e) = copy_res {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = fs::rename(&tmp, dst) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
-}
-
-fn copy_new_file(src: &Path, dst: &Path) -> Result<()> {
-    if let Err(e) = fs::copy(src, dst) {
+    } else {
+        let err = std::io::Error::last_os_error();
+        drop(dst_file);
         let _ = fs::remove_file(dst);
+        Err(err)
+    }
+}
+
+/// Whole-file cold copy. Tries platform reflink/clone first:
+/// macOS `clonefile()` or Linux `FICLONE`. Falls back to `fs::copy`, which
+/// itself uses efficient kernel copy paths where available.
+fn fast_copy(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if try_clonefile(src, dst).is_ok() {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if try_reflink(src, dst).is_ok() {
+            return Ok(());
+        }
+    }
+    fs::copy(src, dst)?;
+    Ok(())
+}
+
+fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
+    let (tmp, out) = unique_tmp(dst)?;
+    drop(out);
+    // clonefile/fs::copy expect dst to NOT exist; unique_tmp just created it.
+    let _ = fs::remove_file(&tmp);
+    if let Err(e) = fast_copy(src, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn write_atomic(
+    dst: &Path,
+    mut writer_fn: impl FnMut(&mut BufWriter<fs::File>) -> Result<()>,
+) -> Result<()> {
+    let (tmp, f) = unique_tmp(dst)?;
+    let mut w = BufWriter::new(f);
+    let res: Result<()> = (|| {
+        writer_fn(&mut w)?;
+        w.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
     Ok(())
@@ -444,7 +568,6 @@ fn sync_one(
     entry: &FileEntry,
     opts: &SyncOpts,
 ) -> Result<(bool, u64, u64)> {
-    // Single stat — reused for mtime check AND basis_exists determination
     let mut dst_meta = dst.symlink_metadata().ok();
     if dst_meta
         .as_ref()
@@ -455,12 +578,10 @@ fn sync_one(
     }
     let basis_exists = dst_meta.is_some();
 
-    // --ignore-existing
     if opts.ignore_existing && basis_exists {
         return Ok((false, 0, entry.size));
     }
 
-    // mtime/size quick skip (default, unless --checksum or --dry-run)
     if !opts.checksum
         && !opts.dry_run
         && let Some(ref m) = dst_meta
@@ -486,73 +607,36 @@ fn sync_one(
         return Ok((true, entry.size, 0));
     }
 
-    // Dirs are pre-created in sync_local; only needed for network receiver path
-    // where we don't have the pre-create phase.
-    // Fast path: new file — copy directly to dst (no tmp needed, nothing to protect)
+    // Cold copy or whole-file: try APFS clone first, then fall back.
     if !basis_exists && !opts.checksum {
-        copy_new_file(src, dst)?;
-        set_metadata(dst, entry, opts)?;
+        fast_copy(src, dst)?;
+        set_metadata(dst, entry, opts, true)?;
         if opts.verbose {
             eprintln!("{}", entry.path.display());
         }
         return Ok((true, entry.size, 0));
     }
 
-    // Very large files: skip delta to avoid multi-GB mmap page-fault hangs
-    const DELTA_SIZE_LIMIT: u64 = 512 * 1024 * 1024; // 512 MB
-    if !opts.checksum && entry.size > DELTA_SIZE_LIMIT {
-        copy_file_atomically(src, dst)?;
-        set_metadata(dst, entry, opts)?;
+    if (!opts.checksum && entry.size > DELTA_SIZE_LIMIT) || (opts.whole_file && !opts.checksum) {
+        copy_atomic(src, dst)?;
+        set_metadata(dst, entry, opts, true)?;
         if opts.verbose {
             eprintln!("{}", entry.path.display());
         }
         return Ok((true, entry.size, 0));
     }
 
-    if opts.whole_file && !opts.checksum {
-        copy_file_atomically(src, dst)?;
-        set_metadata(dst, entry, opts)?;
-        if opts.verbose {
-            eprintln!("{}", entry.path.display());
-        }
-        return Ok((true, entry.size, 0));
-    }
+    // ── delta path ─────────────────────────────────────────────────────────
+    let src_bytes = read_for_delta(src, entry.size)?;
+    let src_data = src_bytes.as_slice();
 
-    // Delta path
-    let src_bytes = if entry.size >= MMAP_THRESHOLD {
-        let f = fs::File::open(src)?;
-        SrcBytes::Mmap(unsafe { Mmap::map(&f)? })
-    } else {
-        SrcBytes::Heap(fs::read(src)?)
-    };
-    let src_data: &[u8] = match &src_bytes {
-        SrcBytes::Mmap(m) => m,
-        SrcBytes::Heap(v) => v,
-    };
-
-    // Mmap basis (dst) for large files to avoid heap allocation
-    enum BasisBytes {
-        Mmap(Mmap),
-        Heap(Vec<u8>),
-        Empty,
-    }
     let basis_bytes = if basis_exists {
-        let f = fs::File::open(dst)?;
-        // Use entry.size (from flist, already known) to decide — avoids TOCTOU
-        // between fstat and mmap on a file another process may truncate.
-        if entry.size >= MMAP_THRESHOLD {
-            BasisBytes::Mmap(unsafe { Mmap::map(&f)? })
-        } else {
-            BasisBytes::Heap(fs::read(dst)?)
-        }
+        let basis_size = dst_meta.as_ref().map_or(0, |m| m.len());
+        read_for_delta(dst, basis_size)?
     } else {
-        BasisBytes::Empty
+        Bytes::Empty
     };
-    let basis: &[u8] = match &basis_bytes {
-        BasisBytes::Mmap(m) => m,
-        BasisBytes::Heap(v) => v,
-        BasisBytes::Empty => &[],
-    };
+    let basis = basis_bytes.as_slice();
 
     if opts.checksum && !basis.is_empty() && file_hash(src_data) == file_hash(basis) {
         return Ok((false, 0, src_data.len() as u64));
@@ -563,52 +647,66 @@ fn sync_one(
         .unwrap_or_else(|| auto_block_size(entry.size))
         .clamp(512, 1_048_576);
 
-    let (new_data, lit, matched) = if opts.whole_file || basis.is_empty() {
-        // No delta needed — write src directly
-        copy_file_atomically(src, dst)?;
-        set_metadata(dst, entry, opts)?;
+    if opts.whole_file || basis.is_empty() {
+        copy_atomic(src, dst)?;
+        set_metadata(dst, entry, opts, true)?;
         if opts.verbose {
             eprintln!("{}", entry.path.display());
         }
         return Ok((true, src_data.len() as u64, 0));
+    }
+
+    let sums = basis_sums(basis, blen);
+
+    // Stream patched output directly to disk via PatchWriter; no full-file Vec.
+    let mut lit = 0u64;
+    let mut mat = 0u64;
+    if opts.inplace {
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(dst)?;
+        let mut pw = PatchWriter::new(basis, BufWriter::new(f));
+        let (l, m) = diff_stream(src_data, &sums, blen, &mut pw)?;
+        lit = l as u64;
+        mat = m as u64;
+        let (mut w, hash) = pw.finalize();
+        w.flush()?;
+        debug_assert_eq!(hash, file_hash(src_data));
     } else {
-        let sums = basis_sums(basis, blen);
-        let tokens = diff(src_data, &sums, blen);
-        let (l, m) = token_stats(&tokens);
-        (patch(basis, &tokens), l, m)
-    };
+        write_atomic(dst, |w| {
+            let mut pw = PatchWriter::new(basis, w);
+            let (l, m) = diff_stream(src_data, &sums, blen, &mut pw)?;
+            lit = l as u64;
+            mat = m as u64;
+            let (_, hash) = pw.finalize();
+            debug_assert_eq!(hash, file_hash(src_data));
+            Ok(())
+        })?;
+    }
 
-    anyhow::ensure!(
-        file_hash(&new_data) == file_hash(src_data),
-        "checksum mismatch after patch: {}",
-        src.display()
-    );
-
+    set_metadata(dst, entry, opts, false)?;
     if opts.verbose {
         eprintln!(
             "{}: {}B literal, {}B matched",
             entry.path.display(),
             lit,
-            matched
+            mat
         );
     }
-
-    if opts.inplace {
-        fs::write(dst, &new_data)?;
-    } else {
-        write_file_atomically(dst, &new_data)?;
-    }
-
-    set_metadata(dst, entry, opts)?;
-    Ok((true, lit as u64, matched as u64))
+    Ok((true, lit, mat))
 }
 
-fn set_metadata(path: &Path, entry: &FileEntry, opts: &SyncOpts) -> Result<()> {
-    // Always sync mtime so subsequent incremental runs can skip unchanged files.
-    // preserve_times (-t) controls whether we honor the original timestamp;
-    // without it we still need dst mtime == src mtime for skip detection.
+fn set_metadata(
+    path: &Path,
+    entry: &FileEntry,
+    opts: &SyncOpts,
+    perms_already_copied: bool,
+) -> Result<()> {
     set_mtime(path, entry.mtime)?;
-    if opts.preserve_perms {
+    // fs::copy preserves perms on Unix already; only chmod when patching or
+    // when caller didn't go through fs::copy.
+    if opts.preserve_perms && !perms_already_copied {
         set_mode(path, entry.mode)?;
     }
     if opts.preserve_owner || opts.preserve_group {
@@ -649,36 +747,38 @@ pub fn run_sender(src_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result<S
             ReceiverReq::Done => break,
             ReceiverReq::Sums(sh) => {
                 let idx = sh.file_idx as usize;
-                let entry = src_list.0.get(idx).ok_or_else(|| {
-                    anyhow::anyhow!("file_idx {idx} out of range ({})", src_list.0.len())
-                })?;
+                let entry = src_list
+                    .0
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("file_idx {idx} out of range"))?;
                 let blen = (sh.block_len as usize).clamp(512, 1_048_576);
 
                 let raw = read_sum_blocks(&mut *pipe.rx, sh.count)?;
-                let sums: Vec<BlockSum> = raw
+                let sums: Vec<crate::delta::BlockSum> = raw
                     .into_iter()
                     .enumerate()
-                    .map(|(i, (r, s))| BlockSum {
+                    .map(|(i, (r, s))| crate::delta::BlockSum {
                         rolling: r,
                         strong: s,
                         offset: (i * blen) as u64,
                     })
                     .collect();
 
-                let src_data = fs::read(src_root.join(&entry.path))?;
-                let src_hash = file_hash(&src_data);
-                let tokens = if sh.count == 0 || opts.whole_file {
-                    vec![Token::Data(src_data)]
+                let src_path = src_root.join(&entry.path);
+                let src_bytes = read_for_delta(&src_path, entry.size)?;
+                let src_data = src_bytes.as_slice();
+                let src_hash = file_hash(src_data);
+
+                let (lit, mat) = if sh.count == 0 || opts.whole_file {
+                    let mut sink = WireSink(&mut w);
+                    sink.on_data(src_data)?;
+                    (src_data.len(), 0)
                 } else {
-                    diff(&src_data, &sums, blen)
+                    let mut sink = WireSink(&mut w);
+                    diff_stream(src_data, &sums, blen, &mut sink)?
                 };
 
-                let (lit, mat) = token_stats(&tokens);
                 pstats.add(true, lit as u64, mat as u64);
-
-                for t in &tokens {
-                    write_token(&mut w, t)?;
-                }
                 write_token_end(&mut w)?;
                 write_file_hash(&mut w, &src_hash)?;
                 w.flush()?;
@@ -691,7 +791,39 @@ pub fn run_sender(src_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result<S
 
 // ─── network receiver ────────────────────────────────────────────────────────
 
+/// Streams tokens from the wire into a destination file, copying bytes from
+/// the basis mmap on Copy and from the wire on Data. Hashes incrementally
+/// so the post-transfer integrity check needs no second pass.
+struct ReceiverSink<'b, W: Write> {
+    basis: &'b [u8],
+    out: W,
+    hasher: blake3::Hasher,
+    lit: u64,
+    mat: u64,
+}
+
+impl<'b, W: Write> TokenSink for ReceiverSink<'b, W> {
+    fn on_copy(&mut self, offset: u64, len: u32) -> std::io::Result<()> {
+        let s = offset as usize;
+        let e = s.saturating_add(len as usize).min(self.basis.len());
+        if s < self.basis.len() {
+            let slice = &self.basis[s..e];
+            self.hasher.update(slice);
+            self.out.write_all(slice)?;
+            self.mat += slice.len() as u64;
+        }
+        Ok(())
+    }
+    fn on_data(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.hasher.update(bytes);
+        self.out.write_all(bytes)?;
+        self.lit += bytes.len() as u64;
+        Ok(())
+    }
+}
+
 pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result<Stats> {
+    use crate::protocol::read_file_hash;
     use byteorder::ReadBytesExt;
 
     let tag = pipe.rx.read_u8()?;
@@ -703,7 +835,7 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
         match t {
             TAG_FLIST_ENTRY => file_list.push(read_entry(&mut *pipe.rx)?),
             TAG_FLIST_END => break,
-            other => anyhow::bail!("unexpected tag {other}"),
+            other => bail!("unexpected tag {other}"),
         }
     }
 
@@ -720,7 +852,7 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
     }
 
     for (idx, entry) in file_list.iter().enumerate() {
-        let dst_path = confine_path(dst_root, &entry.path)?;
+        let dst_path = dst_root.join(clean_rel(&entry.path)?);
 
         match &entry.kind {
             EntryKind::Dir => {
@@ -749,11 +881,18 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
             EntryKind::Other => continue,
         }
 
-        let basis = if dst_path.exists() {
-            fs::read(&dst_path)?
+        if let Some(p) = dst_path.parent() {
+            fs::create_dir_all(p)?;
+        }
+
+        let basis_bytes = if dst_path.exists() {
+            let meta = fs::metadata(&dst_path)?;
+            read_for_delta(&dst_path, meta.len())?
         } else {
-            Vec::new()
+            Bytes::Empty
         };
+        let basis = basis_bytes.as_slice();
+
         let blen = opts
             .block_size
             .unwrap_or_else(|| auto_block_size(entry.size))
@@ -761,7 +900,7 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
         let sums = if opts.whole_file {
             Vec::new()
         } else {
-            basis_sums(&basis, blen)
+            basis_sums(basis, blen)
         };
 
         write_sum_head(&mut w, idx as u32, blen as u32, sums.len() as u32)?;
@@ -771,66 +910,65 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
         write_sum_end(&mut w)?;
         w.flush()?;
 
-        let mut lit: usize = 0;
-        let mut mat: usize = 0;
-        let max_reconstructed: usize = 2 * 1024 * 1024 * 1024; // 2 GiB hard cap, not sender-controlled
-        let capacity = usize::try_from(entry.size)
-            .unwrap_or(0)
-            .min(max_reconstructed);
-        let mut new_data = Vec::with_capacity(capacity);
-        loop {
-            match read_token(&mut *pipe.rx)? {
-                None => break,
-                Some(Token::Copy { offset, len }) => {
-                    mat = mat.saturating_add(len as usize);
-                    let s = offset as usize;
-                    let e = s.saturating_add(len as usize).min(basis.len());
-                    if s < basis.len() {
-                        new_data.extend_from_slice(&basis[s..e]);
-                    }
-                }
-                Some(Token::Data(data)) => {
-                    lit = lit.saturating_add(data.len());
-                    new_data.extend_from_slice(&data);
-                }
-            }
-            anyhow::ensure!(
-                new_data.len() <= max_reconstructed,
-                "reconstructed data exceeds limit for {}",
-                entry.path.display()
-            );
+        // Stream tokens directly into a tmp file — never materialise the new
+        // file in memory.
+        let (tmp, f) = unique_tmp(&dst_path)?;
+        let mut bw = BufWriter::new(f);
+        let mut sink = ReceiverSink {
+            basis,
+            out: &mut bw,
+            hasher: blake3::Hasher::new(),
+            lit: 0,
+            mat: 0,
+        };
+        let stream_res: Result<()> = (|| {
+            apply_token_stream(&mut *pipe.rx, &mut sink)?;
+            Ok(())
+        })();
+        if let Err(e) = stream_res {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
+        let lit = sink.lit;
+        let mat = sink.mat;
+        let computed = *sink.hasher.finalize().as_bytes();
+        bw.flush()?;
+        drop(bw);
+
         let expected = read_file_hash(&mut *pipe.rx)?;
+        if computed != expected {
+            let _ = fs::remove_file(&tmp);
+            bail!("hash mismatch: {}", entry.path.display());
+        }
 
-        anyhow::ensure!(
-            file_hash(&new_data) == expected,
-            "hash mismatch: {}",
-            entry.path.display()
-        );
+        if opts.inplace {
+            fs::rename(&tmp, &dst_path).or_else(|_| {
+                let data = fs::read(&tmp)?;
+                let _ = fs::remove_file(&tmp);
+                fs::write(&dst_path, data)
+            })?;
+        } else {
+            if let Err(e) = fs::rename(&tmp, &dst_path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        }
 
-        pstats.add(true, lit as u64, mat as u64);
+        pstats.add(true, lit, mat);
 
         if let Some(tx) = &opts.progress_tx {
             let _ = tx.send(ProgressEvent::File(FileRecord {
                 path: entry.path.display().to_string(),
                 size: entry.size,
-                literal: lit as u64,
-                matched: mat as u64,
+                literal: lit,
+                matched: mat,
                 skipped: false,
             }));
         } else if opts.verbose || opts.progress {
             eprintln!("{}", entry.path.display());
         }
 
-        if let Some(p) = dst_path.parent() {
-            fs::create_dir_all(p)?;
-        }
-        if opts.inplace {
-            fs::write(&dst_path, &new_data)?;
-        } else {
-            write_file_atomically(&dst_path, &new_data)?;
-        }
-        set_metadata(&dst_path, entry, opts)?;
+        set_metadata(&dst_path, entry, opts, false)?;
     }
 
     write_done(&mut w)?;
@@ -893,12 +1031,15 @@ fn set_owner(_: &Path, _: u32, _: u32, _: bool, _: bool) -> Result<()> {
 
 pub fn print_stats(s: &Stats) {
     fn human(n: u64) -> String {
-        if n >= 1 << 30 {
-            format!("{:.2} GB", n as f64 / (1 << 30) as f64)
-        } else if n >= 1 << 20 {
-            format!("{:.2} MB", n as f64 / (1 << 20) as f64)
-        } else if n >= 1 << 10 {
-            format!("{:.2} KB", n as f64 / (1 << 10) as f64)
+        const G: u64 = 1 << 30;
+        const M: u64 = 1 << 20;
+        const K: u64 = 1 << 10;
+        if n >= G {
+            format!("{:.2} GB", n as f64 / G as f64)
+        } else if n >= M {
+            format!("{:.2} MB", n as f64 / M as f64)
+        } else if n >= K {
+            format!("{:.2} KB", n as f64 / K as f64)
         } else {
             format!("{} B", n)
         }
@@ -924,8 +1065,6 @@ pub fn print_stats(s: &Stats) {
 mod tests {
     use super::*;
     use std::fs;
-
-    // ── confine_path ────────────────────────────────────────────────────────────
 
     #[test]
     fn confine_path_normal() {
@@ -967,8 +1106,6 @@ mod tests {
         assert!(!safe_symlink_target(Path::new("../outside")));
         assert!(!safe_symlink_target(Path::new("dir/../../outside")));
     }
-
-    // ── sync_local integration ──────────────────────────────────────────────────
 
     fn default_opts() -> SyncOpts {
         SyncOpts {
@@ -1135,15 +1272,11 @@ mod tests {
             ..Default::default()
         };
         sync_local(src.path(), dst.path(), &opts).unwrap();
-
-        // dst file should be unchanged
         assert_eq!(
             fs::read(dst.path().join("file.txt")).unwrap(),
             b"old content"
         );
     }
-
-    // ── protocol bounds ─────────────────────────────────────────────────────────
 
     #[test]
     fn protocol_max_sum_blocks_rejected() {

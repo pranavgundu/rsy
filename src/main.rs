@@ -82,6 +82,70 @@ fn finish(stats: Stats, verbose: bool, show_stats: bool) {
     }
 }
 
+fn run_with_output<F>(
+    out_mode: OutputMode,
+    opts: SyncOpts,
+    verbose: bool,
+    show_stats: bool,
+    display_src: String,
+    display_dst: String,
+    run: F,
+) -> Result<()>
+where
+    F: FnOnce(SyncOpts) -> Result<Stats> + Send + 'static,
+{
+    match out_mode {
+        OutputMode::Plain => {
+            let stats = run(opts)?;
+            finish(stats, verbose, show_stats);
+        }
+        OutputMode::Log => {
+            let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
+            let tx_err = tx.clone();
+            let mut run_opts = opts;
+            run_opts.progress_tx = Some(tx);
+            let sync_thread = std::thread::spawn(move || {
+                let result = run(run_opts);
+                if let Err(err) = &result {
+                    let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
+                }
+                result
+            });
+            let _ = drain_log(rx);
+            let stats = sync_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("sync panicked"))??;
+            finish(stats, verbose, show_stats);
+        }
+        OutputMode::Tui => {
+            let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
+            let tx_err = tx.clone();
+            let mut run_opts = opts;
+            run_opts.progress_tx = Some(tx);
+            let sync_thread = std::thread::spawn(move || {
+                let result = run(run_opts);
+                if let Err(err) = &result {
+                    let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
+                }
+                result
+            });
+            let tui_result = tui::run_tui(display_src, display_dst, rx)?;
+            let join_result = sync_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("sync panicked"))?;
+            let stats = match tui_result {
+                Some(s) => {
+                    join_result?;
+                    s
+                }
+                None => join_result?,
+            };
+            finish(stats, verbose, show_stats);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -150,172 +214,61 @@ fn main() -> Result<()> {
     let show_stats = opts.stats;
 
     match cli::parse_mode(&cli) {
-        Mode::Local { src, dst } => match out_mode {
-            OutputMode::Tui => {
-                let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
-                let tx_err = tx.clone();
-                let mut run_opts = opts;
-                run_opts.progress_tx = Some(tx);
-                let src2 = src.clone();
-                let dst2 = dst.clone();
-                let sync_thread = std::thread::spawn(move || {
-                    let result =
-                        pipeline::sync_local(Path::new(&src2), Path::new(&dst2), &run_opts);
-                    if let Err(err) = &result {
-                        let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
-                    }
-                    result
-                });
-                let tui_result = tui::run_tui(src, dst, rx)?;
-                let stats = match tui_result {
-                    Some(s) => {
-                        let _ = sync_thread.join();
-                        s
-                    }
-                    None => sync_thread
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("sync panicked"))??,
-                };
-                finish(stats, verbose, show_stats);
-            }
-            OutputMode::Log => {
-                let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
-                let tx_err = tx.clone();
-                let mut run_opts = opts;
-                run_opts.progress_tx = Some(tx);
-                let src2 = src.clone();
-                let dst2 = dst.clone();
-                let sync_thread = std::thread::spawn(move || {
-                    let result =
-                        pipeline::sync_local(Path::new(&src2), Path::new(&dst2), &run_opts);
-                    if let Err(err) = &result {
-                        let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
-                    }
-                    result
-                });
-                let stats = drain_log(rx);
-                let _ = sync_thread.join();
-                finish(stats, verbose, show_stats);
-            }
-            OutputMode::Plain => {
-                let stats = pipeline::sync_local(Path::new(&src), Path::new(&dst), &opts)?;
-                finish(stats, verbose, show_stats);
-            }
-        },
+        Mode::Local { src, dst } => {
+            let src_run = src.clone();
+            let dst_run = dst.clone();
+            run_with_output(
+                out_mode,
+                opts,
+                verbose,
+                show_stats,
+                src,
+                dst,
+                move |run_opts| {
+                    pipeline::sync_local(Path::new(&src_run), Path::new(&dst_run), &run_opts)
+                },
+            )?;
+        }
 
         Mode::SshPush {
             host,
             src,
             remote_dst,
-        } => match out_mode {
-            OutputMode::Tui => {
-                let mut pipe = transport::ssh::connect(&host, &remote_dst, false)?;
-                pipe.wait_for_remote()?;
-                let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
-                let tx_err = tx.clone();
-                let mut run_opts = opts;
-                run_opts.progress_tx = Some(tx);
-                let src2 = src.clone();
-                let sync_thread = std::thread::spawn(move || {
-                    let result = pipeline::run_sender(Path::new(&src2), &mut pipe, &run_opts);
-                    if let Err(err) = &result {
-                        let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
-                    }
-                    result
-                });
-                let tui_result = tui::run_tui(src, format!("{}:{}", host, remote_dst), rx)?;
-                let stats = match tui_result {
-                    Some(s) => {
-                        let _ = sync_thread.join();
-                        s
-                    }
-                    None => sync_thread
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("sync panicked"))??,
-                };
-                finish(stats, verbose, show_stats);
-            }
-            OutputMode::Log => {
-                let mut pipe = transport::ssh::connect(&host, &remote_dst, false)?;
-                let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
-                let tx_err = tx.clone();
-                let mut run_opts = opts;
-                run_opts.progress_tx = Some(tx);
-                let src2 = src.clone();
-                let sync_thread = std::thread::spawn(move || {
-                    let result = pipeline::run_sender(Path::new(&src2), &mut pipe, &run_opts);
-                    if let Err(err) = &result {
-                        let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
-                    }
-                    result
-                });
-                let stats = drain_log(rx);
-                let _ = sync_thread.join();
-                finish(stats, verbose, show_stats);
-            }
-            OutputMode::Plain => {
-                let mut pipe = transport::ssh::connect(&host, &remote_dst, false)?;
-                let stats = pipeline::run_sender(Path::new(&src), &mut pipe, &opts)?;
-                finish(stats, verbose, show_stats);
-            }
-        },
+        } => {
+            let mut pipe = transport::ssh::connect(&host, &remote_dst, false)?;
+            pipe.wait_for_remote()?;
+            let src_run = src.clone();
+            let display_dst = format!("{}:{}", host, remote_dst);
+            run_with_output(
+                out_mode,
+                opts,
+                verbose,
+                show_stats,
+                src,
+                display_dst,
+                move |run_opts| pipeline::run_sender(Path::new(&src_run), &mut pipe, &run_opts),
+            )?;
+        }
 
         Mode::SshPull {
             host,
             remote_src,
             dst,
-        } => match out_mode {
-            OutputMode::Tui => {
-                let mut pipe = transport::ssh::connect(&host, &remote_src, true)?;
-                pipe.wait_for_remote()?;
-                let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
-                let tx_err = tx.clone();
-                let mut run_opts = opts;
-                run_opts.progress_tx = Some(tx);
-                let dst2 = dst.clone();
-                let sync_thread = std::thread::spawn(move || {
-                    let result = pipeline::run_receiver(Path::new(&dst2), &mut pipe, &run_opts);
-                    if let Err(err) = &result {
-                        let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
-                    }
-                    result
-                });
-                let tui_result = tui::run_tui(format!("{}:{}", host, remote_src), dst, rx)?;
-                let stats = match tui_result {
-                    Some(s) => {
-                        let _ = sync_thread.join();
-                        s
-                    }
-                    None => sync_thread
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("sync panicked"))??,
-                };
-                finish(stats, verbose, show_stats);
-            }
-            OutputMode::Log => {
-                let mut pipe = transport::ssh::connect(&host, &remote_src, true)?;
-                let (tx, rx) = crossbeam_channel::unbounded::<ProgressEvent>();
-                let tx_err = tx.clone();
-                let mut run_opts = opts;
-                run_opts.progress_tx = Some(tx);
-                let dst2 = dst.clone();
-                let sync_thread = std::thread::spawn(move || {
-                    let result = pipeline::run_receiver(Path::new(&dst2), &mut pipe, &run_opts);
-                    if let Err(err) = &result {
-                        let _ = tx_err.send(ProgressEvent::Error(err.to_string()));
-                    }
-                    result
-                });
-                let stats = drain_log(rx);
-                let _ = sync_thread.join();
-                finish(stats, verbose, show_stats);
-            }
-            OutputMode::Plain => {
-                let mut pipe = transport::ssh::connect(&host, &remote_src, true)?;
-                let stats = pipeline::run_receiver(Path::new(&dst), &mut pipe, &opts)?;
-                finish(stats, verbose, show_stats);
-            }
-        },
+        } => {
+            let mut pipe = transport::ssh::connect(&host, &remote_src, true)?;
+            pipe.wait_for_remote()?;
+            let dst_run = dst.clone();
+            let display_src = format!("{}:{}", host, remote_src);
+            run_with_output(
+                out_mode,
+                opts,
+                verbose,
+                show_stats,
+                display_src,
+                dst,
+                move |run_opts| pipeline::run_receiver(Path::new(&dst_run), &mut pipe, &run_opts),
+            )?;
+        }
 
         Mode::Server { sender_side, path } => {
             let mut pipe = transport::Pipe::new(std::io::stdin(), std::io::stdout());

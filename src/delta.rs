@@ -1,6 +1,7 @@
 use crate::checksum::{RollingSum, rolling_sum, strong_sum};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::io::{self, Write};
 
 #[derive(Debug, Clone)]
 pub struct BlockSum {
@@ -10,11 +11,10 @@ pub struct BlockSum {
 }
 
 /// Threshold above which we parallelize block-checksum computation within a
-/// single file.  Below this, file-level parallelism from the caller is enough.
+/// single file. Below this, file-level parallelism from the caller is enough.
 const PAR_SUMS_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Compute block checksums for the basis (destination) file.
-/// Uses rayon only for large files to avoid par overhead on small ones.
 pub fn basis_sums(data: &[u8], blen: usize) -> Vec<BlockSum> {
     if data.is_empty() || blen == 0 {
         return Vec::new();
@@ -31,30 +31,45 @@ pub fn basis_sums(data: &[u8], blen: usize) -> Vec<BlockSum> {
     }
 }
 
+/// Sender-side token. Borrows literal runs directly from `src` — zero copy.
 #[derive(Debug)]
-pub enum Token {
+#[allow(dead_code)]
+pub enum SrcToken<'a> {
     Copy { offset: u64, len: u32 },
-    Data(Vec<u8>),
+    Data(&'a [u8]),
 }
 
-/// Produce minimal token stream to turn `basis` into `src`.
-///
-/// Uses a rolling (weak) checksum + blake3 (strong) checksum with a
-/// FxHashMap for O(1) block lookup.  Window slides one byte at a time,
-/// so worst-case is O(src_len) weak checks + a handful of strong checks.
-pub fn diff(src: &[u8], sums: &[BlockSum], blen: usize) -> Vec<Token> {
+/// Streaming sink for tokens. Sender side writes wire format; local patch path
+/// writes reconstructed bytes to disk.
+pub trait TokenSink {
+    fn on_copy(&mut self, basis_offset: u64, len: u32) -> io::Result<()>;
+    fn on_data(&mut self, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// Walk `src` against block sums, emitting Copy/Data tokens into `sink`.
+/// Returns (literal_bytes, matched_bytes).
+pub fn diff_stream<S: TokenSink>(
+    src: &[u8],
+    sums: &[BlockSum],
+    blen: usize,
+    sink: &mut S,
+) -> io::Result<(usize, usize)> {
+    let mut lit = 0usize;
+    let mut mat = 0usize;
+
     if sums.is_empty() {
-        return if src.is_empty() {
-            Vec::new()
-        } else {
-            vec![Token::Data(src.to_vec())]
-        };
+        if !src.is_empty() {
+            sink.on_data(src)?;
+            lit = src.len();
+        }
+        return Ok((lit, mat));
     }
     if src.is_empty() {
-        return Vec::new();
+        return Ok((0, 0));
     }
     if src.len() < blen {
-        return vec![Token::Data(src.to_vec())];
+        sink.on_data(src)?;
+        return Ok((src.len(), 0));
     }
 
     // rolling digest → indices into `sums`
@@ -64,25 +79,22 @@ pub fn diff(src: &[u8], sums: &[BlockSum], blen: usize) -> Vec<Token> {
         table.entry(bs.rolling).or_default().push(i as u32);
     }
 
-    let mut tokens: Vec<Token> = Vec::new();
     let mut pos: usize = 0;
     let mut lit_start: usize = 0;
     let mut rs = RollingSum::init(&src[0..blen]);
 
     loop {
         let d = rs.digest();
-
         if let Some(cands) = table.get(&d) {
             let strong = strong_sum(&src[pos..pos + blen]);
             if let Some(&idx) = cands.iter().find(|&&i| sums[i as usize].strong == strong) {
-                // Flush pending literals
                 if lit_start < pos {
-                    tokens.push(Token::Data(src[lit_start..pos].to_vec()));
+                    let chunk = &src[lit_start..pos];
+                    sink.on_data(chunk)?;
+                    lit += chunk.len();
                 }
-                tokens.push(Token::Copy {
-                    offset: sums[idx as usize].offset,
-                    len: blen as u32,
-                });
+                sink.on_copy(sums[idx as usize].offset, blen as u32)?;
+                mat += blen;
                 pos += blen;
                 lit_start = pos;
                 if pos + blen > src.len() {
@@ -93,7 +105,6 @@ pub fn diff(src: &[u8], sums: &[BlockSum], blen: usize) -> Vec<Token> {
             }
         }
 
-        // Slide window one byte
         let out = src[pos];
         pos += 1;
         if pos + blen > src.len() {
@@ -103,12 +114,83 @@ pub fn diff(src: &[u8], sums: &[BlockSum], blen: usize) -> Vec<Token> {
     }
 
     if lit_start < src.len() {
-        tokens.push(Token::Data(src[lit_start..].to_vec()));
+        let chunk = &src[lit_start..];
+        sink.on_data(chunk)?;
+        lit += chunk.len();
     }
-    tokens
+    Ok((lit, mat))
 }
 
-/// Reconstruct file from basis + token stream
+/// Apply a stream of tokens against `basis`, writing the reconstructed bytes
+/// into `out`. Used by the local delta path to avoid materialising the full
+/// new file in memory.
+pub struct PatchWriter<'b, W: Write> {
+    basis: &'b [u8],
+    out: W,
+    hasher: blake3::Hasher,
+}
+
+impl<'b, W: Write> PatchWriter<'b, W> {
+    pub fn new(basis: &'b [u8], out: W) -> Self {
+        Self {
+            basis,
+            out,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+    pub fn finalize(self) -> (W, [u8; 32]) {
+        (self.out, *self.hasher.finalize().as_bytes())
+    }
+}
+
+impl<'b, W: Write> TokenSink for PatchWriter<'b, W> {
+    fn on_copy(&mut self, offset: u64, len: u32) -> io::Result<()> {
+        let s = offset as usize;
+        let e = s.saturating_add(len as usize).min(self.basis.len());
+        if s < self.basis.len() {
+            let slice = &self.basis[s..e];
+            self.hasher.update(slice);
+            self.out.write_all(slice)?;
+        }
+        Ok(())
+    }
+    fn on_data(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.hasher.update(bytes);
+        self.out.write_all(bytes)
+    }
+}
+
+// ─── test helpers (also used by network code paths via shared sink trait) ────
+
+/// Materialised token (used by tests and the receiver path which needs to own
+/// data read from the wire).
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
+pub enum Token {
+    Copy { offset: u64, len: u32 },
+    Data(Vec<u8>),
+}
+
+/// Collect tokens into a Vec — convenience for tests and small in-memory paths.
+#[cfg(test)]
+pub fn diff(src: &[u8], sums: &[BlockSum], blen: usize) -> Vec<Token> {
+    struct Vec_(Vec<Token>);
+    impl TokenSink for Vec_ {
+        fn on_copy(&mut self, offset: u64, len: u32) -> io::Result<()> {
+            self.0.push(Token::Copy { offset, len });
+            Ok(())
+        }
+        fn on_data(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.0.push(Token::Data(bytes.to_vec()));
+            Ok(())
+        }
+    }
+    let mut v = Vec_(Vec::new());
+    diff_stream(src, sums, blen, &mut v).expect("Vec sink never fails");
+    v.0
+}
+
+#[cfg(test)]
 pub fn patch(basis: &[u8], tokens: &[Token]) -> Vec<u8> {
     let cap: usize = tokens
         .iter()
@@ -117,7 +199,6 @@ pub fn patch(basis: &[u8], tokens: &[Token]) -> Vec<u8> {
             Token::Data(d) => d.len(),
         })
         .sum();
-
     let mut out = Vec::with_capacity(cap);
     for t in tokens {
         match t {
@@ -134,15 +215,16 @@ pub fn patch(basis: &[u8], tokens: &[Token]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 pub fn token_stats(tokens: &[Token]) -> (usize, usize) {
-    let (mut lit, mut matched) = (0usize, 0usize);
+    let (mut lit, mut mat) = (0usize, 0usize);
     for t in tokens {
         match t {
-            Token::Copy { len, .. } => matched += *len as usize,
+            Token::Copy { len, .. } => mat += *len as usize,
             Token::Data(d) => lit += d.len(),
         }
     }
-    (lit, matched)
+    (lit, mat)
 }
 
 #[cfg(test)]
@@ -159,12 +241,11 @@ mod tests {
     #[test]
     fn identical_files_are_all_copy() {
         let blen = 64usize;
-        // make length an exact multiple of blen so there's no tail literal
         let data = vec![0xABu8; blen * 20];
         let sums = basis_sums(&data, blen);
         let tokens = diff(&data, &sums, blen);
         let (lit, matched) = token_stats(&tokens);
-        assert_eq!(lit, 0, "identical files: zero literal bytes expected");
+        assert_eq!(lit, 0);
         assert!(matched > 0);
         round_trip(&data, &data, blen);
     }
@@ -192,15 +273,12 @@ mod tests {
         basis[4000] = 1;
         let mut src = basis.clone();
         src[4000] = 2;
-        let (_, matched) = {
-            let sums = basis_sums(&basis, 700);
-            let tokens = diff(&src, &sums, 700);
-            let stats = token_stats(&tokens);
-            let got = patch(&basis, &tokens);
-            assert_eq!(got, src);
-            stats
-        };
-        assert!(matched > 0, "unchanged blocks should be copied");
+        let sums = basis_sums(&basis, 700);
+        let tokens = diff(&src, &sums, 700);
+        let (_, matched) = token_stats(&tokens);
+        let got = patch(&basis, &tokens);
+        assert_eq!(got, src);
+        assert!(matched > 0);
     }
 
     #[test]
@@ -210,8 +288,7 @@ mod tests {
 
     #[test]
     fn empty_src_nonempty_basis() {
-        let basis = b"some existing data";
-        round_trip(&[], basis, 700);
+        round_trip(&[], b"some existing data", 700);
     }
 
     #[test]
@@ -224,7 +301,6 @@ mod tests {
 
     #[test]
     fn delete_bytes_from_middle() {
-        // remove 500 bytes from middle — surrounding blocks should match
         let basis: Vec<u8> = (0u8..=255).cycle().take(8000).collect();
         let src: Vec<u8> = basis[..3000]
             .iter()
@@ -242,7 +318,7 @@ mod tests {
         let sums = basis_sums(&basis, blen);
         let tokens = diff(&src, &sums, blen);
         let (lit, matched) = token_stats(&tokens);
-        assert_eq!(matched, 0, "no blocks should match");
+        assert_eq!(matched, 0);
         assert_eq!(lit, src.len());
         round_trip(&src, &basis, blen);
     }
@@ -257,28 +333,25 @@ mod tests {
     #[test]
     fn repeated_pattern_reuses_blocks() {
         let blen = 64usize;
-        // src has many copies of same block — delta should reuse from basis
         let block = vec![0x42u8; blen];
-        let basis: Vec<u8> = block.repeat(4); // 4 blocks
-        let src: Vec<u8> = block.repeat(8); // 8 blocks — all matchable from basis
+        let basis: Vec<u8> = block.repeat(4);
+        let src: Vec<u8> = block.repeat(8);
         let sums = basis_sums(&basis, blen);
         let tokens = diff(&src, &sums, blen);
-        let (lit, _matched) = token_stats(&tokens);
-        assert_eq!(lit, 0, "all blocks present in basis, zero literal bytes");
+        let (lit, _) = token_stats(&tokens);
+        assert_eq!(lit, 0);
         round_trip(&src, &basis, blen);
     }
 
     #[test]
     fn large_file_parallel_sums_match_serial() {
-        // PAR_SUMS_THRESHOLD is 4MB — create a file just above it
         let data: Vec<u8> = (0u8..=255).cycle().take(4 * 1024 * 1024 + 1).collect();
         let blen = 700;
         let par = basis_sums(&data, blen);
-        // force serial by chunking manually
         let serial: Vec<_> = data
             .chunks(blen)
             .enumerate()
-            .map(|(i, chunk)| crate::delta::BlockSum {
+            .map(|(i, chunk)| BlockSum {
                 rolling: crate::checksum::rolling_sum(chunk),
                 strong: crate::checksum::strong_sum(chunk),
                 offset: (i * blen) as u64,
@@ -290,5 +363,21 @@ mod tests {
             assert_eq!(p.strong, s.strong);
             assert_eq!(p.offset, s.offset);
         }
+    }
+
+    #[test]
+    fn patch_writer_streams() {
+        let basis = b"hello world repeated content".repeat(50);
+        let mut src = basis.clone();
+        src[10] = b'X';
+        let sums = basis_sums(&basis, 64);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pw = PatchWriter::new(&basis, &mut buf);
+        diff_stream(&src, &sums, 64, &mut pw).unwrap();
+        let (_, hash) = pw.finalize();
+
+        assert_eq!(buf, src);
+        assert_eq!(hash, *blake3::hash(&src).as_bytes());
     }
 }

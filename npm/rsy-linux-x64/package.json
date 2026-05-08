@@ -1,6 +1,6 @@
 {
   "name": "@gundu/rsy-linux-x64",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "rsy binary for linux-x64",
   "os": ["linux"],
   "cpu": ["x64"],

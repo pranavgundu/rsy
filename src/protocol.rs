@@ -1,4 +1,6 @@
+#[cfg(test)]
 use crate::delta::Token;
+use crate::delta::{SrcToken, TokenSink};
 use crate::flist::{EntryKind, FileEntry};
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 /// Wire protocol for network (SSH / daemon) mode.
@@ -220,6 +222,8 @@ pub fn read_sum_blocks<R: Read + ?Sized>(
 
 // ── token stream (sender → receiver) ─────────────────────────────────────────
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn write_token<W: Write>(w: &mut W, t: &Token) -> io::Result<()> {
     match t {
         Token::Copy { offset, len } => {
@@ -228,6 +232,33 @@ pub fn write_token<W: Write>(w: &mut W, t: &Token) -> io::Result<()> {
             w.write_u32::<LE>(*len)
         }
         Token::Data(data) => write_data_tokens(w, data, MAX_TOKEN_DATA),
+    }
+}
+
+/// Streaming sink that writes tokens directly to the wire — zero allocation
+/// on the sender side.
+pub struct WireSink<'w, W: Write>(pub &'w mut W);
+
+impl<'w, W: Write> TokenSink for WireSink<'w, W> {
+    fn on_copy(&mut self, offset: u64, len: u32) -> io::Result<()> {
+        self.0.write_u8(TAG_TOKEN_COPY)?;
+        self.0.write_u64::<LE>(offset)?;
+        self.0.write_u32::<LE>(len)
+    }
+    fn on_data(&mut self, bytes: &[u8]) -> io::Result<()> {
+        write_data_tokens(self.0, bytes, MAX_TOKEN_DATA)
+    }
+}
+
+#[allow(dead_code)]
+pub fn write_src_token<W: Write>(w: &mut W, t: &SrcToken<'_>) -> io::Result<()> {
+    match *t {
+        SrcToken::Copy { offset, len } => {
+            w.write_u8(TAG_TOKEN_COPY)?;
+            w.write_u64::<LE>(offset)?;
+            w.write_u32::<LE>(len)
+        }
+        SrcToken::Data(bytes) => write_data_tokens(w, bytes, MAX_TOKEN_DATA),
     }
 }
 
@@ -254,7 +285,50 @@ fn write_data_tokens<W: Write>(w: &mut W, data: &[u8], chunk_size: usize) -> io:
     Ok(())
 }
 
+/// Stream tokens from the wire into a sink. Reads literal-data tokens in
+/// 64 KiB chunks so receivers can write directly to disk without buffering
+/// whole files in memory.
+pub fn apply_token_stream<R: Read + ?Sized, S: TokenSink>(
+    r: &mut R,
+    sink: &mut S,
+) -> io::Result<()> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let tag = r.read_u8()?;
+        match tag {
+            TAG_TOKEN_COPY => {
+                let offset = r.read_u64::<LE>()?;
+                let len = r.read_u32::<LE>()?;
+                sink.on_copy(offset, len)?;
+            }
+            TAG_TOKEN_DATA => {
+                let mut n = r.read_u32::<LE>()? as usize;
+                if n > MAX_TOKEN_DATA {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("token data size {n} exceeds maximum {MAX_TOKEN_DATA}"),
+                    ));
+                }
+                while n > 0 {
+                    let take = n.min(buf.len());
+                    r.read_exact(&mut buf[..take])?;
+                    sink.on_data(&buf[..take])?;
+                    n -= take;
+                }
+            }
+            TAG_TOKEN_END => return Ok(()),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected token tag: {other}"),
+                ));
+            }
+        }
+    }
+}
+
 /// Read next token; `None` = TAG_TOKEN_END
+#[cfg(test)]
 pub fn read_token<R: Read + ?Sized>(r: &mut R) -> io::Result<Option<Token>> {
     let tag = r.read_u8()?;
     match tag {

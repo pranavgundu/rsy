@@ -371,74 +371,54 @@ const DELTA_CORPUS: CorpusSpec = CorpusSpec {
 
 // ── bench fns ─────────────────────────────────────────────────────────────
 
-fn bench_cold_10k_4kb(c: &mut Criterion) {
-    cold_sync_bench(c, S_10K_4KB);
-}
-fn bench_cold_50k_4kb(c: &mut Criterion) {
-    cold_sync_bench(c, S_50K_4KB);
-}
-fn bench_cold_100k_4kb(c: &mut Criterion) {
-    cold_sync_bench(c, S_100K_4KB);
-}
-fn bench_cold_500_1mb(c: &mut Criterion) {
-    cold_sync_bench(c, M_500_1MB);
-}
-fn bench_cold_2k_1mb(c: &mut Criterion) {
-    cold_sync_bench(c, M_2K_1MB);
-}
-fn bench_cold_10k_1mb(c: &mut Criterion) {
-    cold_sync_bench(c, M_10K_1MB);
-}
-fn bench_cold_100_16mb(c: &mut Criterion) {
-    cold_sync_bench(c, L_100_16MB);
-}
-fn bench_cold_500_16mb(c: &mut Criterion) {
-    cold_sync_bench(c, L_500_16MB);
-}
-fn bench_cold_1gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_16_64MB);
-}
-fn bench_cold_2gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_32_64MB);
-}
-fn bench_cold_4gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_64_64MB);
-}
-fn bench_cold_10gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_160_64MB);
-}
-fn bench_cold_15gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_240_64MB);
-}
-fn bench_cold_25gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_400_64MB);
-}
-fn bench_cold_40gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_640_64MB);
-}
-fn bench_cold_50gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_800_64MB);
-}
-fn bench_cold_100gb(c: &mut Criterion) {
-    cold_sync_bench(c, L_1600_64MB);
+macro_rules! cold_bench {
+    ($name:ident, $spec:ident) => {
+        fn $name(c: &mut Criterion) {
+            cold_sync_bench(c, $spec);
+        }
+    };
 }
 
-fn bench_incr_10k_4kb(c: &mut Criterion) {
-    incremental_bench(c, S_10K_4KB);
-}
-fn bench_incr_500_1mb(c: &mut Criterion) {
-    incremental_bench(c, M_500_1MB);
-}
-fn bench_incr_1gb(c: &mut Criterion) {
-    incremental_bench(c, L_16_64MB);
-}
-fn bench_incr_10gb(c: &mut Criterion) {
-    incremental_bench(c, L_160_64MB);
+macro_rules! incremental_bench_fn {
+    ($name:ident, $spec:ident) => {
+        fn $name(c: &mut Criterion) {
+            incremental_bench(c, $spec);
+        }
+    };
 }
 
-fn bench_delta(c: &mut Criterion) {
-    delta_bench(c, DELTA_CORPUS);
+macro_rules! delta_bench_fn {
+    ($name:ident, $spec:ident) => {
+        fn $name(c: &mut Criterion) {
+            delta_bench(c, $spec);
+        }
+    };
 }
+
+cold_bench!(bench_cold_10k_4kb, S_10K_4KB);
+cold_bench!(bench_cold_50k_4kb, S_50K_4KB);
+cold_bench!(bench_cold_100k_4kb, S_100K_4KB);
+cold_bench!(bench_cold_500_1mb, M_500_1MB);
+cold_bench!(bench_cold_2k_1mb, M_2K_1MB);
+cold_bench!(bench_cold_10k_1mb, M_10K_1MB);
+cold_bench!(bench_cold_100_16mb, L_100_16MB);
+cold_bench!(bench_cold_500_16mb, L_500_16MB);
+cold_bench!(bench_cold_1gb, L_16_64MB);
+cold_bench!(bench_cold_2gb, L_32_64MB);
+cold_bench!(bench_cold_4gb, L_64_64MB);
+cold_bench!(bench_cold_10gb, L_160_64MB);
+cold_bench!(bench_cold_15gb, L_240_64MB);
+cold_bench!(bench_cold_25gb, L_400_64MB);
+cold_bench!(bench_cold_40gb, L_640_64MB);
+cold_bench!(bench_cold_50gb, L_800_64MB);
+cold_bench!(bench_cold_100gb, L_1600_64MB);
+
+incremental_bench_fn!(bench_incr_10k_4kb, S_10K_4KB);
+incremental_bench_fn!(bench_incr_500_1mb, M_500_1MB);
+incremental_bench_fn!(bench_incr_1gb, L_16_64MB);
+incremental_bench_fn!(bench_incr_10gb, L_160_64MB);
+
+delta_bench_fn!(bench_delta, DELTA_CORPUS);
 
 criterion_group!(
     cold,
