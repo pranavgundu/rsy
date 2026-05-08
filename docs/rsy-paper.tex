@@ -1,0 +1,283 @@
+\documentclass[11pt]{article}
+
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,booktabs,enumitem,hyperref,microtype}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=black,
+  citecolor=black,
+  pdfauthor={Pranav Gundu},
+  pdftitle={rsy: A Mathematical Note on Parallel File Synchronization}
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+
+\newcommand{\rsy}{\texttt{rsy}}
+\newcommand{\bytes}{\mathcal{B}}
+\newcommand{\files}{\mathcal{F}}
+\newcommand{\dirs}{\mathcal{D}}
+\newcommand{\links}{\mathcal{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+
+\title{\vspace{-2em}\rsy:\ A Mathematical Note on Parallel File Synchronization}
+\author{Pranav Gundu}
+\date{Revision 1.1.3}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note models \rsy, a Rust file synchronization tool for local copies, SSH transfers, and daemon-style \texttt{rsync://} targets. The emphasis is mathematical: file-list construction is treated as a parallel traversal problem, filtering as an ordered predicate system, cold copies as a kernel-assisted byte movement problem, and warm synchronizations as a rolling-checksum delta problem. The current release pipeline is also expressed as a dependency relation: continuous deployment is blocked unless continuous integration first proves formatting, linting, building, and testing.
+\end{abstract}
+
+\section{Objects and Cost Model}
+
+Let the source tree be a finite rooted tree
+\[
+  \mathcal{T} = (V,E), \qquad V = \files \cup \dirs \cup \links,
+\]
+where $\files$ is the set of regular files, $\dirs$ the set of directories, and $\links$ the set of symbolic links. Let
+\[
+  F = |\files|, \quad D = |\dirs|, \quad L = |\links|, \quad N = F + D + L.
+\]
+Each regular file $f_i \in \files$ has size $b_i$, mode $m_i$, modification time $\tau_i$, and relative path $p_i$. Define total byte mass
+\[
+  B = \sum_{i=1}^{F} b_i.
+\]
+
+The observed runtime is decomposed as
+\begin{equation}
+  T = T_{walk} + T_{filter} + T_{meta} + T_{copy} + T_{delta} + T_{transport} + T_{ui}.
+\end{equation}
+For a local cold copy, $T_{transport}=0$ and $T_{delta}\approx0$. For SSH and daemon targets, $T_{transport}$ includes remote process setup, framing, and stream I/O. For warm destinations, $T_{copy}$ may collapse to zero for unchanged files.
+
+\begin{definition}[Skip predicate]
+For source file $s$ and destination file $d$, the default unchanged predicate is
+\begin{equation}
+  U_{mtime}(s,d) \iff |s|=|d| \land \tau(s)=\tau(d).
+\end{equation}
+With \texttt{--checksum}, the predicate becomes
+\begin{equation}
+  U_{hash}(s,d) \iff H(s)=H(d),
+\end{equation}
+where $H$ is the file hash. With \texttt{--update}, a destination-newer predicate
+\begin{equation}
+  N_{dst}(s,d) \iff \tau(d)>\tau(s)
+\end{equation}
+also causes preservation of $d$.
+\end{definition}
+
+\section{Path Classification}
+
+The command parser maps each invocation to exactly one mode. In order, destination daemon syntax is recognized, then destination SSH syntax, then source SSH syntax, otherwise local mode.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Form & Mode & Interpretation \\
+\midrule
+\texttt{rsy SRC/ DST/} & Local & local namespace copy \\
+\texttt{rsy SRC/ host:/path/} & SSH push & local sender, remote receiver \\
+\texttt{rsy host:/path/ DST/} & SSH pull & remote sender, local receiver \\
+\texttt{rsy SRC/ rsync://host/module/path} & Daemon push & daemon transport \\
+\texttt{rsy SRC/ host::module/path} & Daemon push & daemon module syntax \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Trailing slash semantics match \texttt{rsync}: $SRC/$ copies the contents of $SRC$, while $SRC$ copies the directory itself under the destination.
+
+\section{Filtering as an Ordered Predicate System}
+
+A filter list is an ordered sequence
+\[
+  R = (r_1,r_2,\ldots,r_k), \qquad r_j = (kind_j, pattern_j),
+\]
+where $kind_j\in\{include,exclude\}$. A file path $p$ is accepted by the first matching rule:
+\begin{equation}
+  Allow(p) =
+  \begin{cases}
+    1, & \exists j: Match(r_j,p) \land kind_j=include \land \forall \ell<j,\neg Match(r_\ell,p), \\
+    0, & \exists j: Match(r_j,p) \land kind_j=exclude \land \forall \ell<j,\neg Match(r_\ell,p), \\
+    1, & \text{no rule matches.}
+  \end{cases}
+\end{equation}
+Directory-only rules extend to descendants by testing ancestors of $p$.
+
+\begin{proposition}[First-match determinism]
+For a fixed ordered rule list $R$ and path $p$, $Allow(p)$ is deterministic and independent of later matching rules after the first match.
+\end{proposition}
+\begin{proof}
+Let $j^*=\min\{j:Match(r_j,p)\}$. If no such $j^*$ exists, the default is accept. Otherwise the definition depends only on $kind_{j^*}$, so all $r_j$ for $j>j^*$ are irrelevant.
+\end{proof}
+
+\section{Traversal and Parallel Work}
+
+Let $P$ be the number of worker threads. For independent file work with per-file costs $w_i$, ideal scheduling gives
+\begin{equation}
+  T_{parallel} \ge \max\left(\max_i w_i,\frac{1}{P}\sum_{i=1}^{F}w_i\right).
+\end{equation}
+In practice,
+\begin{equation}
+  T_{parallel} = \frac{1}{P_{eff}}\sum_i w_i + T_{sched}+T_{io-contention},
+\end{equation}
+where $1\le P_{eff}\le P$. \rsy defaults to approximately $2\times$ logical CPU count with a minimum of four workers because many file operations are I/O-bound rather than pure CPU-bound.
+
+When \texttt{--delete} is absent, destination inventory is not needed. If $N_s$ and $N_d$ are source and destination node counts, avoiding the destination walk saves approximately
+\begin{equation}
+  \Delta T_{delete=false} \approx c_w N_d + c_m N_d,
+\end{equation}
+where $c_w$ is traversal cost and $c_m$ is metadata inspection cost.
+
+\section{Cold Copy Model}
+
+For a new file, no destination basis exists. The optimal path is therefore whole-file copy, not delta construction. Model the cost for file $i$ as
+\begin{equation}
+  C_i^{cold} = \alpha_{open}+\alpha_{meta}+\beta_i b_i+\alpha_{mtime}.
+\end{equation}
+Here $\beta_i$ depends on the filesystem and kernel primitive. On APFS, \texttt{clonefile()} may make $\beta_i\approx0$ for same-volume copy-on-write; on Linux, \texttt{FICLONE} reflinks may do the same on supporting filesystems. Otherwise $\beta_i$ is normal copy bandwidth cost.
+
+Summing over all cold files gives
+\begin{equation}
+  T_{cold} = F(\alpha_{open}+\alpha_{meta}+\alpha_{mtime}) + \sum_{i=1}^{F}\beta_i b_i.
+\end{equation}
+
+\begin{corollary}[Small-file sensitivity]
+If $b_i$ is small for most files, fixed metadata terms dominate. Parallelizing file work reduces wall time more strongly than increasing sequential byte bandwidth.
+\end{corollary}
+
+\section{Rolling-Checksum Delta Model}
+
+For a warm file with a destination basis, \rsy partitions the basis into blocks of length $q$. For basis block $j$, it stores a weak rolling sum $r_j$ and strong sum $h_j$:
+\begin{equation}
+  \sigma_j=(r_j,h_j,offset_j), \qquad j=0,\ldots,\left\lceil\frac{b}{q}\right\rceil-1.
+\end{equation}
+The sender scans the source with a rolling window. A weak match proposes candidates; a strong match validates a copy token. The output token stream is
+\begin{equation}
+  \Theta = (\theta_1,\ldots,\theta_m), \qquad \theta_j\in\{Data(bytes),Copy(offset,len)\}.
+\end{equation}
+
+Let $\rho\in[0,1]$ be the changed-byte fraction. Ignoring headers, the wire payload is approximately
+\begin{equation}
+  W_{delta} \approx \rho B + c_{tok}\frac{B}{q}.
+\end{equation}
+Whole-file transfer has payload $W_{whole}=B$. Delta is wire-efficient when
+\begin{equation}
+  \rho B + c_{tok}\frac{B}{q} < B
+  \iff
+  \rho < 1-\frac{c_{tok}}{q}.
+\end{equation}
+
+\begin{lemma}[Block-size tradeoff]
+Smaller $q$ increases match granularity but increases signature and token overhead. Larger $q$ reduces overhead but may turn small edits into larger literal regions.
+\end{lemma}
+
+\section{Atomicity and In-Place Updates}
+
+By default, \rsy writes patched output to a temporary file and renames it into place. Let $A$ be the event that interruption occurs during transfer. Atomic replacement ensures that, under normal filesystem rename semantics,
+\begin{equation}
+  A \Rightarrow dst \in \{old, new\},
+\end{equation}
+not an arbitrary prefix. With \texttt{--inplace}, the temporary file is avoided, but interruption can leave a partial destination. Thus \texttt{--inplace} trades safety for reduced replacement overhead and lower temporary space usage.
+
+\section{Path Safety}
+
+The receiver cleans relative paths lexically. A path $p$ is admissible only if
+\begin{equation}
+  \neg Absolute(p) \land \neg ContainsParentTraversal(p) \land Confined(base,p).
+\end{equation}
+For symbolic links, the target $t$ must also be relative and non-escaping:
+\begin{equation}
+  SafeLink(t) \iff \neg Absolute(t) \land depth(t[0..k])\ge0\ \forall k.
+\end{equation}
+
+\section{Command Surface}
+
+The core transfer options are summarized below.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Option & Mathematical or operational effect \\
+\midrule
+\texttt{-a}, \texttt{--archive} & preserve times, permissions, owner, group, symlinks \\
+\texttt{--delete} & remove $dst\setminus src$ after filtered source inventory \\
+\texttt{-u}, \texttt{--update} & apply $N_{dst}(s,d)$ skip predicate \\
+\texttt{--ignore-existing} & skip all $d$ where $exists(d)=true$ \\
+\texttt{-W}, \texttt{--whole-file} & force $W_{whole}$ rather than $W_{delta}$ \\
+\texttt{--inplace} & patch destination directly \\
+\texttt{-c}, \texttt{--checksum} & use $U_{hash}$ rather than $U_{mtime}$ \\
+\texttt{--min-size}, \texttt{--max-size} & restrict files by $b_i$ bounds \\
+\texttt{--exclude-from} & import ordered exclude predicates \\
+\texttt{--log}, \texttt{--no-tui}, \texttt{--stats} & choose output/reporting channel \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Release Pipeline as a Dependency Graph}
+
+Let $C$ be the CI job, $B_m$ the release build matrix, $N$ npm publishing, and $R$ crate publishing. The current workflow enforces
+\begin{equation}
+  C \rightarrow B_m \rightarrow \{N,R\}.
+\end{equation}
+The CI predicate is
+\begin{equation}
+  C = Fmt \land Clippy \land Build_{release} \land Test_{release}.
+\end{equation}
+Therefore publishing is possible only if
+\begin{equation}
+  Publish = C \land B_m.
+\end{equation}
+This is the precise meaning of ``CI must pass before CD.''
+
+\section{Benchmarks}
+
+The benchmark suite uses Criterion and generated corpora. Because corpora and destination trees are created by temporary directories, disk placement is controlled by the environment variable \texttt{TMPDIR}:
+\begin{verbatim}
+mkdir -p "/Volumes/PG Drive/rsy-bench-tmp"
+TMPDIR="/Volumes/PG Drive/rsy-bench-tmp" cargo bench
+\end{verbatim}
+
+Representative README results show speedups in three regimes:
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Scenario & rsy & Comparison & Dominant term \\
+\midrule
+10k files $\times$ 4KB cold & 126 ms & 3.83x faster than rsync & metadata parallelism \\
+500 files $\times$ 1MB cold & 35 ms & 7.77x faster than rsync & parallel byte movement \\
+10 files $\times$ 10MB, 10\% changed & 1.4 ms & 31.43x faster than rsync & delta token efficiency \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Verification}
+
+The binary unit suite currently exercises 69 tests across checksum behavior, rolling delta reconstruction, parser mode detection, filter precedence, filter-file loading, path confinement, protocol bounds, dry-run behavior, deletion, size filtering, update preservation, and whole-file replacement. The release CI gate runs formatting, clippy, release build, and release tests before any tagged CD build can start.
+
+\section{Conclusion}
+
+The design of \rsy\ is compactly captured by three inequalities. Cold-copy performance improves when metadata and kernel-copy constants shrink:
+\[
+  F\alpha_{meta}+\beta B \ll F\alpha'_{meta}+\beta'B.
+\]
+Delta transfer wins when the changed fraction satisfies
+\[
+  \rho < 1-\frac{c_{tok}}{q}.
+\]
+Release safety improves because deployment is no longer independent of CI:
+\[
+  CD \Rightarrow CI.
+\]
+Together these properties describe the current implementation: fast when copying, conservative when writing, selective when updating, and gated when releasing.
+
+\end{document}
