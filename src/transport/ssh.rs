@@ -116,12 +116,7 @@ fn build_ssh_argv(
 /// Launch the remote `rsy --server [--sender] <path>` over SSH (or a custom
 /// remote shell via `--rsh`) and return a Pipe wired to its stdin/stdout.
 /// A background thread reaps the child when the pipes close.
-pub fn connect(
-    host: &str,
-    remote_path: &str,
-    sender_side: bool,
-    opts: &SshOpts,
-) -> Result<Pipe> {
+pub fn connect(host: &str, remote_path: &str, sender_side: bool, opts: &SshOpts) -> Result<Pipe> {
     let rsy_remote = opts
         .rsync_path
         .clone()
@@ -210,7 +205,10 @@ mod tests {
         };
         let (_, args) = argv("h", false, &opts);
         let s = args.join(" ");
-        assert!(s.contains("-o ConnectTimeout=10"), "missing contimeout: {s}");
+        assert!(
+            s.contains("-o ConnectTimeout=10"),
+            "missing contimeout: {s}"
+        );
         assert!(
             s.contains("-o ServerAliveInterval=30"),
             "missing keepalive: {s}"
@@ -241,8 +239,14 @@ mod tests {
         assert_eq!(prog, "mysh");
         let s = args.join(" ");
         assert!(s.contains("-X"), "rsh extra arg missing: {s}");
-        assert!(!s.contains("-p 22"), "ssh -p must not appear with --rsh: {s}");
-        assert!(!s.contains("-i /k"), "ssh -i must not appear with --rsh: {s}");
+        assert!(
+            !s.contains("-p 22"),
+            "ssh -p must not appear with --rsh: {s}"
+        );
+        assert!(
+            !s.contains("-i /k"),
+            "ssh -i must not appear with --rsh: {s}"
+        );
     }
 
     #[test]
