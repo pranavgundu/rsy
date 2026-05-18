@@ -37,10 +37,16 @@ impl FileList {
     /// Parallel directory walk via jwalk. Reuses lstat metadata captured during
     /// the readdir pass, avoiding a second `symlink_metadata` per entry.
     pub fn build(root: &Path, root_dev: Option<u64>) -> Result<Self> {
+        Self::build_with(root, root_dev, false)
+    }
+
+    /// As `build`, but `follow_links=true` dereferences symlinks: targets are
+    /// recorded as regular files/dirs and symlink loops are protected against.
+    pub fn build_with(root: &Path, root_dev: Option<u64>, follow_links: bool) -> Result<Self> {
         let root = std::fs::canonicalize(root)?;
 
         let walker = WalkDir::new(&root)
-            .follow_links(false)
+            .follow_links(follow_links)
             .skip_hidden(false)
             .sort(true);
 
@@ -80,7 +86,7 @@ impl FileList {
                 .unwrap_or(0);
             let (uid, gid, mode) = platform_meta(&meta);
 
-            let kind = if meta.file_type().is_symlink() {
+            let kind = if !follow_links && meta.file_type().is_symlink() {
                 EntryKind::Symlink {
                     target: std::fs::read_link(&abs).unwrap_or_default(),
                 }

@@ -131,6 +131,11 @@ pub struct SyncOpts {
     pub delete: bool,
     pub update: bool,
     pub ignore_existing: bool,
+    pub existing: bool,
+    pub remove_source_files: bool,
+    pub size_only: bool,
+    pub modify_window: u32,
+    pub copy_links: bool,
     pub whole_file: bool,
     pub checksum: bool,
     pub inplace: bool,
@@ -143,9 +148,19 @@ pub struct SyncOpts {
     pub filter: FilterList,
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
+    pub files_from: Option<HashSet<PathBuf>>,
+    pub prune_empty_dirs: bool,
     pub block_size: Option<usize>,
     pub compress: bool,
+    #[allow(dead_code)]
+    pub bwlimit: Option<u64>,
+    pub backup: bool,
+    pub backup_dir: Option<PathBuf>,
+    pub backup_suffix: String,
+    pub partial: bool,
     pub verbose: bool,
+    pub quiet: bool,
+    pub human_readable: bool,
     pub progress: bool,
     pub stats: bool,
     pub dry_run: bool,
@@ -238,7 +253,7 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
     // Only walk dst when --delete needs the dst inventory. Saves a full tree
     // walk on every cold sync.
     let (src_res, dst_res) = rayon::join(
-        || FileList::build(src_root, root_dev),
+        || FileList::build_with(src_root, root_dev, opts.copy_links),
         || -> Result<FileList> {
             if opts.delete {
                 Ok(FileList::build(dst_root, None).unwrap_or_else(|_| FileList::empty()))
@@ -250,11 +265,17 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
     let src_list = src_res?;
     let dst_list = dst_res?;
 
-    let src_filtered: Vec<&FileEntry> = src_list
+    let src_filtered_initial: Vec<&FileEntry> = src_list
         .0
         .iter()
         .filter(|e| {
             if !opts.filter.is_empty() && !opts.filter.allow(&e.path, e.is_dir()) {
+                return false;
+            }
+            if let Some(ref ff) = opts.files_from
+                && !ff.contains(&e.path)
+                && !e.is_dir()
+            {
                 return false;
             }
             if let Some(max) = opts.max_size
@@ -270,6 +291,12 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
             true
         })
         .collect();
+
+    let src_filtered: Vec<&FileEntry> = if opts.prune_empty_dirs {
+        prune_empty_dirs(&src_filtered_initial)
+    } else {
+        src_filtered_initial
+    };
 
     // Pre-create directories serially (sorted order ensures parents first).
     if !opts.dry_run {
@@ -347,6 +374,14 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
         match sync_one(&src, &dst, entry, opts) {
             Ok((xferred, lit, mat)) => {
                 pstats2.add(xferred, lit, mat);
+                if xferred && opts.remove_source_files && !opts.dry_run {
+                    if let Err(err) = fs::remove_file(&src) {
+                        eprintln!(
+                            "warning: failed to remove source {}: {err}",
+                            entry.path.display()
+                        );
+                    }
+                }
                 if let Some(tx) = &opts.progress_tx {
                     let _ = tx.send(ProgressEvent::File(FileRecord {
                         path: entry.path.to_string_lossy().into_owned(),
@@ -361,7 +396,9 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
                 }
             }
             Err(e) => {
-                eprintln!("warning: {}: {e}", entry.path.display());
+                if !opts.quiet {
+                    eprintln!("warning: {}: {e}", entry.path.display());
+                }
                 pstats2.errored.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -581,6 +618,9 @@ fn sync_one(
     if opts.ignore_existing && basis_exists {
         return Ok((false, 0, entry.size));
     }
+    if opts.existing && !basis_exists {
+        return Ok((false, 0, entry.size));
+    }
 
     if !opts.checksum
         && !opts.dry_run
@@ -592,12 +632,24 @@ fn sync_one(
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(-1);
-        if opts.update && dst_mtime > entry.mtime {
+        if opts.update && dst_mtime > entry.mtime + opts.modify_window as i64 {
             return Ok((false, 0, entry.size));
         }
-        if dst_mtime == entry.mtime && m.len() == entry.size {
+        let mtimes_match = (dst_mtime - entry.mtime).abs() <= opts.modify_window as i64;
+        if opts.size_only {
+            if m.len() == entry.size {
+                return Ok((false, 0, entry.size));
+            }
+        } else if mtimes_match && m.len() == entry.size {
             return Ok((false, 0, entry.size));
         }
+    }
+
+    let mut basis_exists = basis_exists;
+    if basis_exists && opts.backup && !opts.dry_run {
+        do_backup(dst, entry, opts)?;
+        dst_meta = None;
+        basis_exists = false;
     }
 
     if opts.dry_run {
@@ -697,6 +749,71 @@ fn sync_one(
     Ok((true, lit, mat))
 }
 
+fn keep_or_remove_partial(tmp: &Path, dst: &Path, opts: &SyncOpts) {
+    if opts.partial {
+        let mut s = dst.as_os_str().to_owned();
+        s.push(".rsy-partial");
+        let part = PathBuf::from(s);
+        if fs::rename(tmp, &part).is_err() {
+            let _ = fs::remove_file(tmp);
+        }
+    } else {
+        let _ = fs::remove_file(tmp);
+    }
+}
+
+fn prune_empty_dirs<'a>(entries: &[&'a FileEntry]) -> Vec<&'a FileEntry> {
+    let mut keep_dirs: FxHashSet<PathBuf> = FxHashSet::default();
+    for e in entries.iter().filter(|e| !e.is_dir()) {
+        let mut p = e.path.parent();
+        while let Some(parent) = p {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if !keep_dirs.insert(parent.to_path_buf()) {
+                break;
+            }
+            p = parent.parent();
+        }
+    }
+    entries
+        .iter()
+        .copied()
+        .filter(|e| !e.is_dir() || keep_dirs.contains(&e.path))
+        .collect()
+}
+
+fn do_backup(dst: &Path, entry: &FileEntry, opts: &SyncOpts) -> Result<()> {
+    if let Some(ref dir) = opts.backup_dir {
+        let rel = clean_rel(&entry.path)?;
+        let backup_path = dir.join(&rel);
+        if !opts.backup_suffix.is_empty() {
+            let mut s = backup_path.into_os_string();
+            s.push(&opts.backup_suffix);
+            let backup_path = PathBuf::from(s);
+            if let Some(p) = backup_path.parent() {
+                fs::create_dir_all(p)?;
+            }
+            let _ = fs::rename(dst, &backup_path);
+        } else {
+            if let Some(p) = backup_path.parent() {
+                fs::create_dir_all(p)?;
+            }
+            let _ = fs::rename(dst, &backup_path);
+        }
+    } else {
+        let mut s = dst.as_os_str().to_owned();
+        if opts.backup_suffix.is_empty() {
+            s.push("~");
+        } else {
+            s.push(&opts.backup_suffix);
+        }
+        let backup_path = PathBuf::from(s);
+        let _ = fs::rename(dst, &backup_path);
+    }
+    Ok(())
+}
+
 fn set_metadata(
     path: &Path,
     entry: &FileEntry,
@@ -729,7 +846,7 @@ pub fn run_sender(src_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result<S
     } else {
         None
     };
-    let src_list = FileList::build(src_root, root_dev)?;
+    let src_list = FileList::build_with(src_root, root_dev, opts.copy_links)?;
     let mut w = BufWriter::new(&mut *pipe.tx);
 
     write_flist_start(&mut w)?;
@@ -926,7 +1043,7 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
             Ok(())
         })();
         if let Err(e) = stream_res {
-            let _ = fs::remove_file(&tmp);
+            keep_or_remove_partial(&tmp, &dst_path, opts);
             return Err(e);
         }
         let lit = sink.lit;
@@ -937,7 +1054,7 @@ pub fn run_receiver(dst_root: &Path, pipe: &mut Pipe, opts: &SyncOpts) -> Result
 
         let expected = read_file_hash(&mut *pipe.rx)?;
         if computed != expected {
-            let _ = fs::remove_file(&tmp);
+            keep_or_remove_partial(&tmp, &dst_path, opts);
             bail!("hash mismatch: {}", entry.path.display());
         }
 
@@ -1338,6 +1455,322 @@ mod tests {
             fs::read(dst.path().join("file.txt")).unwrap(),
             b"old content"
         );
+    }
+
+    #[test]
+    fn sync_existing_skips_new_files_at_dst() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("new.txt"), b"new").unwrap();
+        fs::write(src.path().join("present.txt"), b"updated").unwrap();
+        fs::write(dst.path().join("present.txt"), b"old").unwrap();
+
+        let opts = SyncOpts {
+            existing: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert!(!dst.path().join("new.txt").exists());
+        assert_eq!(
+            fs::read(dst.path().join("present.txt")).unwrap(),
+            b"updated"
+        );
+    }
+
+    #[test]
+    fn sync_remove_source_files_deletes_src_after_transfer() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("a.txt"), b"payload").unwrap();
+        fs::write(src.path().join("b.txt"), b"second").unwrap();
+
+        let opts = SyncOpts {
+            remove_source_files: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert!(!src.path().join("a.txt").exists());
+        assert!(!src.path().join("b.txt").exists());
+        assert!(dst.path().join("a.txt").exists());
+        assert!(dst.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn sync_size_only_skips_when_size_matches_mtime_differs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"abcdef").unwrap();
+        fs::write(dst.path().join("f.txt"), b"123456").unwrap();
+        let t_old = filetime::FileTime::from_unix_time(1_000, 0);
+        let t_new = filetime::FileTime::from_unix_time(9_000, 0);
+        filetime::set_file_mtime(src.path().join("f.txt"), t_new).unwrap();
+        filetime::set_file_mtime(dst.path().join("f.txt"), t_old).unwrap();
+
+        let opts = SyncOpts {
+            size_only: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        let stats = sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert_eq!(stats.files_xferred, 0);
+        assert_eq!(fs::read(dst.path().join("f.txt")).unwrap(), b"123456");
+    }
+
+    #[test]
+    fn sync_modify_window_treats_close_mtimes_as_equal() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"same-size!").unwrap();
+        fs::write(dst.path().join("f.txt"), b"same-size!").unwrap();
+        let t_src = filetime::FileTime::from_unix_time(1_000, 0);
+        let t_dst = filetime::FileTime::from_unix_time(1_003, 0);
+        filetime::set_file_mtime(src.path().join("f.txt"), t_src).unwrap();
+        filetime::set_file_mtime(dst.path().join("f.txt"), t_dst).unwrap();
+
+        let opts = SyncOpts {
+            modify_window: 5,
+            preserve_times: true,
+            ..Default::default()
+        };
+        let stats = sync_local(src.path(), dst.path(), &opts).unwrap();
+        assert_eq!(stats.files_xferred, 0);
+        assert_eq!(stats.files_skipped, 1);
+    }
+
+    #[test]
+    fn sync_modify_window_zero_transfers_off_by_one() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"same-size!").unwrap();
+        fs::write(dst.path().join("f.txt"), b"same-size!").unwrap();
+        let t_src = filetime::FileTime::from_unix_time(1_000, 0);
+        let t_dst = filetime::FileTime::from_unix_time(1_001, 0);
+        filetime::set_file_mtime(src.path().join("f.txt"), t_src).unwrap();
+        filetime::set_file_mtime(dst.path().join("f.txt"), t_dst).unwrap();
+
+        let stats = sync_local(src.path(), dst.path(), &default_opts()).unwrap();
+        assert_eq!(stats.files_xferred, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_copy_links_dereferences_symlink_to_regular_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("real.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink("real.txt", src.path().join("link.txt")).unwrap();
+
+        let opts = SyncOpts {
+            copy_links: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        let link_meta = fs::symlink_metadata(dst.path().join("link.txt")).unwrap();
+        assert!(
+            link_meta.file_type().is_file(),
+            "with --copy-links, dst entry must be a regular file"
+        );
+        assert_eq!(fs::read(dst.path().join("link.txt")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn sync_files_from_filters_to_listed_paths() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("a.txt"), b"a").unwrap();
+        fs::write(src.path().join("b.txt"), b"b").unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        fs::write(src.path().join("sub/c.txt"), b"c").unwrap();
+
+        let mut ff = HashSet::new();
+        ff.insert(PathBuf::from("a.txt"));
+        ff.insert(PathBuf::from("sub/c.txt"));
+        let opts = SyncOpts {
+            files_from: Some(ff),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert!(dst.path().join("a.txt").exists());
+        assert!(!dst.path().join("b.txt").exists());
+        assert!(dst.path().join("sub/c.txt").exists());
+    }
+
+    #[test]
+    fn sync_prune_empty_dirs_drops_dirs_with_no_kept_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir(src.path().join("empty")).unwrap();
+        fs::create_dir(src.path().join("kept")).unwrap();
+        fs::write(src.path().join("kept/file.txt"), b"x").unwrap();
+
+        let opts = SyncOpts {
+            prune_empty_dirs: true,
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert!(!dst.path().join("empty").exists());
+        assert!(dst.path().join("kept/file.txt").exists());
+    }
+
+    #[test]
+    fn sync_backup_default_suffix_renames_existing_dst() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"replacement-bytes").unwrap();
+        fs::write(dst.path().join("f.txt"), b"old").unwrap();
+
+        let opts = SyncOpts {
+            backup: true,
+            backup_suffix: "~".to_string(),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert_eq!(
+            fs::read(dst.path().join("f.txt")).unwrap(),
+            b"replacement-bytes"
+        );
+        assert_eq!(fs::read(dst.path().join("f.txt~")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn sync_backup_custom_suffix() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"replacement-bytes").unwrap();
+        fs::write(dst.path().join("f.txt"), b"old").unwrap();
+
+        let opts = SyncOpts {
+            backup: true,
+            backup_suffix: ".bak".to_string(),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+        assert_eq!(fs::read(dst.path().join("f.txt.bak")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn sync_backup_dir_relocates_backup() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"replacement-bytes").unwrap();
+        fs::write(dst.path().join("f.txt"), b"old").unwrap();
+
+        let opts = SyncOpts {
+            backup: true,
+            backup_dir: Some(backup.path().to_path_buf()),
+            backup_suffix: String::new(),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+
+        assert_eq!(fs::read(backup.path().join("f.txt")).unwrap(), b"old");
+        assert!(!dst.path().join("f.txt~").exists());
+        assert_eq!(
+            fs::read(dst.path().join("f.txt")).unwrap(),
+            b"replacement-bytes"
+        );
+    }
+
+    #[test]
+    fn sync_backup_skipped_when_dst_absent() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"new").unwrap();
+
+        let opts = SyncOpts {
+            backup: true,
+            backup_suffix: "~".to_string(),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+        assert!(!dst.path().join("f.txt~").exists());
+        assert_eq!(fs::read(dst.path().join("f.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn sync_backup_not_taken_when_file_skipped() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f.txt"), b"same").unwrap();
+        fs::write(dst.path().join("f.txt"), b"same").unwrap();
+        let t = filetime::FileTime::from_unix_time(1_000, 0);
+        filetime::set_file_mtime(src.path().join("f.txt"), t).unwrap();
+        filetime::set_file_mtime(dst.path().join("f.txt"), t).unwrap();
+
+        let opts = SyncOpts {
+            backup: true,
+            backup_suffix: "~".to_string(),
+            preserve_times: true,
+            ..Default::default()
+        };
+        sync_local(src.path(), dst.path(), &opts).unwrap();
+        assert!(!dst.path().join("f.txt~").exists());
+    }
+
+    #[test]
+    fn prune_empty_dirs_keeps_ancestor_chain() {
+        let entries = vec![
+            FileEntry {
+                path: PathBuf::from("a"),
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                kind: EntryKind::Dir,
+            },
+            FileEntry {
+                path: PathBuf::from("a/b"),
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                kind: EntryKind::Dir,
+            },
+            FileEntry {
+                path: PathBuf::from("a/b/c.txt"),
+                size: 1,
+                mtime: 0,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                kind: EntryKind::Regular,
+            },
+            FileEntry {
+                path: PathBuf::from("empty"),
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                kind: EntryKind::Dir,
+            },
+        ];
+        let refs: Vec<&FileEntry> = entries.iter().collect();
+        let kept = super::prune_empty_dirs(&refs);
+        let paths: Vec<_> = kept.iter().map(|e| e.path.clone()).collect();
+        assert!(paths.contains(&PathBuf::from("a")));
+        assert!(paths.contains(&PathBuf::from("a/b")));
+        assert!(paths.contains(&PathBuf::from("a/b/c.txt")));
+        assert!(!paths.contains(&PathBuf::from("empty")));
     }
 
     #[test]

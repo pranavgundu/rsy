@@ -91,6 +91,35 @@ pub struct Cli {
     #[arg(long)]
     pub ignore_existing: bool,
 
+    /// Skip creating new files at the destination — only update files that
+    /// already exist there.
+    #[arg(help_heading = "Transfer Control")]
+    #[arg(long)]
+    pub existing: bool,
+
+    /// Remove source files after a successful transfer.
+    ///
+    /// Files are deleted only after the transfer completes without error.
+    /// Directories are never removed.
+    #[arg(help_heading = "Transfer Control")]
+    #[arg(long)]
+    pub remove_source_files: bool,
+
+    /// Skip files based on size only, ignoring modification time.
+    #[arg(help_heading = "Transfer Control")]
+    #[arg(long)]
+    pub size_only: bool,
+
+    /// Treat mtimes within SEC seconds of each other as equal.
+    #[arg(help_heading = "Transfer Control")]
+    #[arg(long, value_name = "SEC")]
+    pub modify_window: Option<u32>,
+
+    /// Follow symlinks and transfer the file they point to instead of the link.
+    #[arg(help_heading = "Transfer Control")]
+    #[arg(short = 'L', long)]
+    pub copy_links: bool,
+
     /// Transfer whole files instead of using the delta algorithm.
     ///
     /// This can be faster for local same-filesystem copies, cold copies, or
@@ -153,6 +182,26 @@ pub struct Cli {
     #[arg(long, value_name = "SIZE")]
     pub min_size: Option<String>,
 
+    /// Read the list of source-relative file paths from FILE.
+    ///
+    /// Only paths listed are transferred. Paths are taken verbatim relative to
+    /// the source root. One per line by default; pair with `--from0` for
+    /// null-terminated input.
+    #[arg(help_heading = "Filtering")]
+    #[arg(long, value_name = "FILE")]
+    pub files_from: Option<String>,
+
+    /// Use a null byte as the line terminator for `--files-from` and
+    /// `--exclude-from`.
+    #[arg(help_heading = "Filtering")]
+    #[arg(short = '0', long)]
+    pub from0: bool,
+
+    /// Drop empty directories from the source list after filtering.
+    #[arg(help_heading = "Filtering")]
+    #[arg(short = 'm', long)]
+    pub prune_empty_dirs: bool,
+
     // ── metadata preservation ─────────────────────────────────────────────
     /// Preserve modification times.
     ///
@@ -203,16 +252,93 @@ pub struct Cli {
     #[arg(short = 'z', long)]
     pub compress: bool,
 
+    /// Limit transfer bandwidth to RATE bytes/sec.
+    ///
+    /// Accepts plain bytes or K/M/G suffixes.
+    #[arg(help_heading = "Algorithm")]
+    #[arg(long, value_name = "RATE")]
+    pub bwlimit: Option<String>,
+
+    // ── backup ───────────────────────────────────────────────────────────
+    /// Make backups of destination files before overwriting them.
+    #[arg(help_heading = "Backup")]
+    #[arg(short = 'b', long)]
+    pub backup: bool,
+
+    /// Store backups in DIR instead of next to the original file.
+    ///
+    /// Implies `--backup`.
+    #[arg(help_heading = "Backup")]
+    #[arg(long, value_name = "DIR")]
+    pub backup_dir: Option<String>,
+
+    /// Append SUFFIX to backed-up file names. Defaults to "~" with no
+    /// `--backup-dir`, or empty when `--backup-dir` is set.
+    #[arg(help_heading = "Backup")]
+    #[arg(long, value_name = "SUFFIX")]
+    pub suffix: Option<String>,
+
+    // ── accepted-but-not-implemented for compatibility ────────────────────
+    /// Preserve hard links (accepted; not yet implemented).
+    #[arg(help_heading = "Compatibility")]
+    #[arg(short = 'H', long)]
+    pub hard_links: bool,
+
+    /// Preserve ACLs (accepted; not yet implemented).
+    #[arg(help_heading = "Compatibility")]
+    #[arg(short = 'A', long)]
+    pub acls: bool,
+
+    /// Preserve extended attributes (accepted; not yet implemented).
+    #[arg(help_heading = "Compatibility")]
+    #[arg(short = 'X', long)]
+    pub xattrs: bool,
+
+    /// Preserve device files (accepted; not yet implemented).
+    #[arg(help_heading = "Compatibility")]
+    #[arg(short = 'D', long)]
+    pub devices: bool,
+
+    /// Handle sparse files efficiently (accepted; not yet implemented).
+    #[arg(help_heading = "Compatibility")]
+    #[arg(short = 'S', long)]
+    pub sparse: bool,
+
+    /// Hard-link to files in DIR when unchanged (accepted; not yet implemented).
+    #[arg(help_heading = "Compatibility")]
+    #[arg(long, value_name = "DIR")]
+    pub link_dest: Option<String>,
+
     // ── output ────────────────────────────────────────────────────────────
     /// Print transferred file names and a final summary.
     #[arg(help_heading = "Output")]
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
+    /// Suppress non-error output.
+    #[arg(help_heading = "Output")]
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    /// Show transferred byte counts in human-readable units (K/M/G).
+    #[arg(help_heading = "Output")]
+    #[arg(long)]
+    pub human_readable: bool,
+
     /// Show per-file transfer progress.
     #[arg(help_heading = "Output")]
     #[arg(long)]
     pub progress: bool,
+
+    /// Equivalent to `--partial --progress`.
+    #[arg(help_heading = "Output")]
+    #[arg(short = 'P')]
+    pub partial_progress: bool,
+
+    /// Keep partially-transferred files on error so subsequent runs can resume.
+    #[arg(help_heading = "Output")]
+    #[arg(long)]
+    pub partial: bool,
 
     /// Print transfer statistics at the end.
     #[arg(help_heading = "Output")]
@@ -254,6 +380,51 @@ pub struct Cli {
     #[arg(help_heading = "SSH")]
     #[arg(short = 'i', long, value_name = "FILE")]
     pub identity: Option<String>,
+
+    /// Remote shell command to use instead of `ssh`.
+    ///
+    /// The command is split on whitespace. The host and remote command are
+    /// appended automatically.
+    #[arg(help_heading = "SSH")]
+    #[arg(short = 'e', long, value_name = "COMMAND")]
+    pub rsh: Option<String>,
+
+    /// Forward through an SSH jump host (`ssh -J`).
+    #[arg(help_heading = "SSH")]
+    #[arg(short = 'J', long, value_name = "HOST")]
+    pub jump: Option<String>,
+
+    /// Use FILE as an alternative `ssh_config`.
+    #[arg(help_heading = "SSH")]
+    #[arg(short = 'F', long = "ssh-config", value_name = "FILE")]
+    pub ssh_config: Option<String>,
+
+    /// Enable SSH-level compression (`ssh -C`).
+    #[arg(help_heading = "SSH")]
+    #[arg(short = 'C', long)]
+    pub ssh_compress: bool,
+
+    /// Pass `-o OPT` to the underlying ssh command. Repeatable.
+    #[arg(help_heading = "SSH")]
+    #[arg(long = "ssh-opt", value_name = "OPT")]
+    pub ssh_opts: Vec<String>,
+
+    /// SSH connection timeout in seconds.
+    #[arg(help_heading = "SSH")]
+    #[arg(long, value_name = "SEC")]
+    pub contimeout: Option<u32>,
+
+    /// SSH keepalive interval in seconds. Triggers disconnect after three
+    /// missed replies.
+    #[arg(help_heading = "SSH")]
+    #[arg(long, value_name = "SEC")]
+    pub timeout: Option<u32>,
+
+    /// Path to the `rsy` binary on the remote host. Overrides
+    /// `$RSY_REMOTE_BIN`.
+    #[arg(help_heading = "SSH")]
+    #[arg(long, value_name = "PROG")]
+    pub rsync_path: Option<String>,
 
     // ── server flags (hidden, invoked via SSH) ─────────────────────────────
     #[arg(long, hide = true)]
