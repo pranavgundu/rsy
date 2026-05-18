@@ -164,7 +164,7 @@ pub struct Cli {
 
     /// Preserve file permissions.
     #[arg(help_heading = "Metadata")]
-    #[arg(short = 'p', long)]
+    #[arg(long)]
     pub perms: bool,
 
     /// Preserve file owner.
@@ -243,6 +243,17 @@ pub struct Cli {
     #[arg(help_heading = "Performance")]
     #[arg(short = 'j', long)]
     pub jobs: Option<usize>,
+
+    // ── SSH options ───────────────────────────────────────────────────────
+    /// SSH port for remote connections.
+    #[arg(help_heading = "SSH")]
+    #[arg(short = 'p', long, value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// SSH identity file (private key) for remote connections.
+    #[arg(help_heading = "SSH")]
+    #[arg(short = 'i', long, value_name = "FILE")]
+    pub identity: Option<String>,
 
     // ── server flags (hidden, invoked via SSH) ─────────────────────────────
     #[arg(long, hide = true)]

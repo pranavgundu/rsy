@@ -212,6 +212,8 @@ fn main() -> Result<()> {
 
     let verbose = opts.verbose;
     let show_stats = opts.stats;
+    let ssh_port = cli.port;
+    let ssh_identity = cli.identity.clone();
 
     match cli::parse_mode(&cli) {
         Mode::Local { src, dst } => {
@@ -235,7 +237,7 @@ fn main() -> Result<()> {
             src,
             remote_dst,
         } => {
-            let mut pipe = transport::ssh::connect(&host, &remote_dst, false)?;
+            let mut pipe = transport::ssh::connect(&host, &remote_dst, false, ssh_port, ssh_identity.as_deref())?;
             pipe.wait_for_remote()?;
             let src_run = src.clone();
             let display_dst = format!("{}:{}", host, remote_dst);
@@ -255,7 +257,7 @@ fn main() -> Result<()> {
             remote_src,
             dst,
         } => {
-            let mut pipe = transport::ssh::connect(&host, &remote_src, true)?;
+            let mut pipe = transport::ssh::connect(&host, &remote_src, true, ssh_port, ssh_identity.as_deref())?;
             pipe.wait_for_remote()?;
             let dst_run = dst.clone();
             let display_src = format!("{}:{}", host, remote_src);

@@ -4,7 +4,13 @@ use std::process::{Command, Stdio};
 
 /// Launch `ssh <host> rsy --server [--sender] <path>` and return a Pipe
 /// wired to the child's stdin/stdout.  A background thread reaps the child.
-pub fn connect(host: &str, remote_path: &str, sender_side: bool) -> Result<Pipe> {
+pub fn connect(
+    host: &str,
+    remote_path: &str,
+    sender_side: bool,
+    port: Option<u16>,
+    identity: Option<&str>,
+) -> Result<Pipe> {
     let rsy_remote = std::env::var("RSY_REMOTE_BIN").unwrap_or_else(|_| "rsy".into());
     if !rsy_remote
         .chars()
@@ -28,7 +34,14 @@ pub fn connect(host: &str, remote_path: &str, sender_side: bool) -> Result<Pipe>
     }
 
     let mut cmd = Command::new("ssh");
-    cmd.args(["-e", "none", "--", host, &rsy_remote, "--server"]);
+    cmd.args(["-e", "none"]);
+    if let Some(p) = port {
+        cmd.args(["-p", &p.to_string()]);
+    }
+    if let Some(id) = identity {
+        cmd.args(["-i", id]);
+    }
+    cmd.args(["--", host, &rsy_remote, "--server"]);
     if sender_side {
         cmd.arg("--sender");
     }
