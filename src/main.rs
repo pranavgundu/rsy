@@ -84,6 +84,7 @@ fn finish(stats: Stats, verbose: bool, show_stats: bool, quiet: bool, human: boo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with_output<F>(
     out_mode: OutputMode,
     opts: SyncOpts,
@@ -236,6 +237,12 @@ fn main() -> Result<()> {
             "~".to_string()
         }
     });
+    if backup_suffix.contains('/') || backup_suffix.contains('\\') || backup_suffix.contains('\0') {
+        anyhow::bail!(
+            "--suffix must not contain path separators or NUL: {:?}",
+            backup_suffix
+        );
+    }
 
     let opts = SyncOpts {
         delete: cli.delete,

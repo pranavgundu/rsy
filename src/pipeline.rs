@@ -374,13 +374,15 @@ pub fn sync_local(src_root: &Path, dst_root: &Path, opts: &SyncOpts) -> Result<S
         match sync_one(&src, &dst, entry, opts) {
             Ok((xferred, lit, mat)) => {
                 pstats2.add(xferred, lit, mat);
-                if xferred && opts.remove_source_files && !opts.dry_run {
-                    if let Err(err) = fs::remove_file(&src) {
-                        eprintln!(
-                            "warning: failed to remove source {}: {err}",
-                            entry.path.display()
-                        );
-                    }
+                if xferred
+                    && opts.remove_source_files
+                    && !opts.dry_run
+                    && let Err(err) = fs::remove_file(&src)
+                {
+                    eprintln!(
+                        "warning: failed to remove source {}: {err}",
+                        entry.path.display()
+                    );
                 }
                 if let Some(tx) = &opts.progress_tx {
                     let _ = tx.send(ProgressEvent::File(FileRecord {
@@ -1726,7 +1728,7 @@ mod tests {
 
     #[test]
     fn prune_empty_dirs_keeps_ancestor_chain() {
-        let entries = vec![
+        let entries = [
             FileEntry {
                 path: PathBuf::from("a"),
                 size: 0,

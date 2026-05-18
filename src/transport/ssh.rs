@@ -29,18 +29,75 @@ fn validate_remote_bin(bin: &str) -> Result<()> {
 }
 
 fn validate_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        anyhow::bail!("host is empty");
+    }
     if host.starts_with('-') {
         anyhow::bail!("host looks like an ssh flag: {host:?}");
     }
     if host.chars().any(|c| {
-        matches!(
-            c,
-            '`' | '$' | '\\' | '\'' | '"' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | '\n' | '\r'
-        )
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '$'
+                    | '\\'
+                    | '\''
+                    | '"'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '*'
+                    | '?'
+                    | '\0'
+            )
     }) {
         anyhow::bail!("host contains unsafe characters: {host:?}");
     }
     Ok(())
+}
+
+fn validate_remote_path(p: &str) -> Result<()> {
+    if p.is_empty() {
+        anyhow::bail!("remote path is empty");
+    }
+    if p.starts_with('-') {
+        anyhow::bail!(
+            "remote path must not start with '-' (would be parsed as a flag by the remote rsy): {p:?}"
+        );
+    }
+    if p.contains('\0') {
+        anyhow::bail!("remote path contains NUL: {p:?}");
+    }
+    Ok(())
+}
+
+/// Quote a string for safe interpolation into a POSIX shell command. SSH
+/// concatenates the remote argv with spaces and hands the result to the remote
+/// login shell, so any unquoted metacharacter in `s` would be re-tokenised
+/// remotely.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | ',' | ':' | '=' | '+')
+        })
+    {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Build the (program, args) the SSH transport will spawn. Pulled out of
@@ -109,7 +166,11 @@ fn build_ssh_argv(
     if sender_side {
         args.push("--sender".into());
     }
-    args.push(remote_path.to_string());
+    // `--` terminates remote rsy flag parsing so a path-like value cannot be
+    // misread as an option. The path itself is shell-quoted because ssh joins
+    // remote argv with spaces and hands the result to the remote login shell.
+    args.push("--".into());
+    args.push(shell_quote(remote_path));
     Ok((prog, args))
 }
 
@@ -124,6 +185,7 @@ pub fn connect(host: &str, remote_path: &str, sender_side: bool, opts: &SshOpts)
         .unwrap_or_else(|| "rsy".into());
     validate_remote_bin(&rsy_remote)?;
     validate_host(host)?;
+    validate_remote_path(remote_path)?;
 
     let (prog, args) = build_ssh_argv(host, remote_path, sender_side, &rsy_remote, opts)?;
     let mut cmd = Command::new(&prog);
@@ -159,8 +221,8 @@ mod tests {
         let (prog, args) = argv("host", false, &opts);
         assert_eq!(prog, "ssh");
         assert_eq!(&args[..2], &["-e", "none"]);
-        let tail = &args[args.len() - 4..];
-        assert_eq!(tail, &["host", "rsy", "--server", "/remote/path"]);
+        let tail = &args[args.len() - 5..];
+        assert_eq!(tail, &["host", "rsy", "--server", "--", "/remote/path"]);
     }
 
     #[test]
@@ -261,6 +323,63 @@ mod tests {
         assert!(validate_remote_bin("rsy").is_ok());
         assert!(validate_remote_bin("/usr/local/bin/rsy").is_ok());
         assert!(validate_remote_bin("rsy; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn validate_remote_path_rejects_leading_dash() {
+        assert!(validate_remote_path("-rf").is_err());
+        assert!(validate_remote_path("--rsync-path=evil").is_err());
+        assert!(validate_remote_path("/tmp/data").is_ok());
+    }
+
+    #[test]
+    fn validate_remote_path_rejects_nul_and_empty() {
+        assert!(validate_remote_path("").is_err());
+        assert!(validate_remote_path("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn validate_host_rejects_whitespace_and_glob() {
+        assert!(validate_host("good-host").is_ok());
+        assert!(validate_host("bad host").is_err());
+        assert!(validate_host("bad\thost").is_err());
+        assert!(validate_host("host*").is_err());
+        assert!(validate_host("host?").is_err());
+        assert!(validate_host("").is_err());
+    }
+
+    #[test]
+    fn shell_quote_passes_through_safe_paths() {
+        assert_eq!(shell_quote("/foo/bar.txt"), "/foo/bar.txt");
+        assert_eq!(shell_quote("a_b-c.d/e:f=g"), "a_b-c.d/e:f=g");
+    }
+
+    #[test]
+    fn shell_quote_wraps_unsafe_chars() {
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("/tmp; rm -rf /"), "'/tmp; rm -rf /'");
+        assert_eq!(shell_quote("$(evil)"), "'$(evil)'");
+        // single quotes inside get escaped via `'\''`
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn ssh_argv_quotes_path_with_metacharacters() {
+        let opts = SshOpts::default();
+        let (_, args) = build_ssh_argv("host", "/tmp; rm -rf ~", false, "rsy", &opts).unwrap();
+        let last = args.last().unwrap();
+        assert_eq!(last, "'/tmp; rm -rf ~'");
+        // `--` separator must sit immediately before the path
+        let dash_idx = args.iter().rposition(|a| a == "--").unwrap();
+        assert_eq!(dash_idx, args.len() - 2);
+    }
+
+    #[test]
+    fn ssh_argv_separator_present_before_path() {
+        let opts = SshOpts::default();
+        let (_, args) = argv("h", false, &opts);
+        // Last two args must be "--" then the (quoted) path.
+        assert_eq!(args[args.len() - 2], "--");
     }
 
     #[test]
